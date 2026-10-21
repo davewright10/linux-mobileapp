@@ -186,6 +186,14 @@ function etcFiles(root: FsNode) {
   const selinux = makeDir();
   selinux.children!.config = makeFile('SELINUX=enforcing\nSELINUXTYPE=targeted\n');
   etc.children!.selinux = selinux;
+  add('rsyslog.conf', '# rsyslog configuration file\n*.info;mail.none;authpriv.none;cron.none    /var/log/messages\nauthpriv.*                                  /var/log/secure\ncron.*                                      /var/log/cron\n$IncludeConfig /etc/rsyslog.d/*.conf\n');
+  etc.children!['rsyslog.d'] = makeDir();
+  add('logrotate.conf', 'weekly\nrotate 4\ncreate\ndateext\ninclude /etc/logrotate.d\n');
+  etc.children!['logrotate.d'] = makeDir();
+  const systemd = makeDir();
+  systemd.children!['journald.conf'] = makeFile('[Journal]\n#Storage=auto\n#Compress=yes\n#SystemMaxUse=\n');
+  systemd.children!.system = makeDir();
+  etc.children!.systemd = systemd;
   etc.children!['skel'] = makeDir();
   etc.children!['skel'].children!['.bashrc'] = makeFile('# .bashrc\n');
   etc.children!['yum.repos.d'] = makeDir();

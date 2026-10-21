@@ -171,6 +171,7 @@ export class Shell {
       if (!canAccess(r.node, 'w', this.uid, this.gids)) throw new FsError('EACCES');
       r.node.content = append ? (r.node.content ?? '') + content : content;
       r.node.mtime = Date.now();
+      syncDynamicFile(this.state, '/' + r.parts.join('/'), r.node.content);
       return;
     }
     const { dir, name } = this.parentFor(path);
@@ -321,6 +322,18 @@ export function groupIdsFor(state: SystemState, user: User): number[] {
   const ids = [user.gid];
   for (const g of state.groups) if (g.members.includes(user.name)) ids.push(g.gid);
   return ids;
+}
+
+/** Edits to generated files that map to simple settings update the system state. */
+function syncDynamicFile(state: SystemState, path: string, content: string) {
+  if (path === '/etc/hostname') {
+    const name = content.trim().split('\n')[0];
+    if (name) state.hostname = name;
+  }
+  if (path === '/etc/selinux/config') {
+    const mode = /^SELINUX=(enforcing|permissive|disabled)\s*$/m.exec(content)?.[1];
+    if (mode) state.selinuxConfigMode = mode as SystemState['selinuxConfigMode'];
+  }
 }
 
 function dynamicFile(state: SystemState, path: string): string | null {

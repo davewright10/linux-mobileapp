@@ -7,8 +7,8 @@ content is original and mapped to the public course outlines and Red Hat's EX200
 
 ## What's in it
 
-- **Two tracks**: Linux Fundamentals (F1–F19) and RHCSA (R1–R26). Modules F1–F19 and R2–R12 have
-  full content so far; the rest show as "coming soon".
+- **Two tracks**: Linux Fundamentals (F1–F19) and RHCSA (R1–R26). Every module has a quiz and
+  flashcards, and most have a terminal lab.
 - **Quizzes** with an explanation for every answer. 80% passes a module.
 - **Flashcards** with simple spaced repetition (Leitner boxes), stored on the device.
 - **Practice terminal**: a simulated RHEL 10 server (`src/shell/`) that runs fully offline, with
