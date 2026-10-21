@@ -9,7 +9,9 @@ import {
   splitPath,
 } from './fs';
 import { ParseError, Pipeline, Word, parse } from './parser';
+import { KERNEL_FILES } from './kernel-state';
 import { SystemState, User, createInitialState } from './state';
+import { STORAGE_FILES } from './storage-state';
 
 export interface Resolved {
   node: FsNode;
@@ -356,6 +358,6 @@ function dynamicFile(state: SystemState, path: string): string | null {
     case '/etc/selinux/config':
       return `SELINUX=${state.selinuxConfigMode}\nSELINUXTYPE=targeted\n`;
     default:
-      return null;
+      return (STORAGE_FILES[path] ?? KERNEL_FILES[path])?.(state) ?? null;
   }
 }

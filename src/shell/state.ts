@@ -1,4 +1,6 @@
 import { FsNode, makeDir, makeFile, makeLink } from './fs';
+import { KernelState, addKernelFiles, initialKernel } from './kernel-state';
+import { StorageState, addStorageFiles, initialStorage } from './storage-state';
 
 export interface User {
   name: string;
@@ -72,6 +74,8 @@ export interface SystemState {
   atJobs: AtJob[];
   timezone: string;
   ntp: boolean;
+  storage: StorageState;
+  kernel: KernelState;
 }
 
 export const FLATPAK_APPS: Record<string, string> = {
@@ -226,6 +230,8 @@ export function createInitialState(): SystemState {
   var_.spool = makeDir();
   var_.spool.children!.cron = makeDir(0, 0, 0o700);
   etcFiles(root);
+  addStorageFiles(root);
+  addKernelFiles(root);
 
   const student = makeDir(1000, 1000, 0o700);
   student.children!['notes.txt'] = makeFile(NOTES, 1000, 1000);
@@ -304,5 +310,7 @@ export function createInitialState(): SystemState {
     atJobs: [],
     timezone: 'America/New_York',
     ntp: true,
+    storage: initialStorage(),
+    kernel: initialKernel(),
   };
 }

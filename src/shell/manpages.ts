@@ -1,5 +1,9 @@
 // Short one-line summaries shown by `man` and `man -k` in the practice terminal.
-export const MAN_PAGES: Record<string, string> = {
+import { KERNEL_MAN } from './commands-kernel';
+import { SCRIPT_MAN } from './commands-script';
+import { STORAGE_MAN } from './commands-storage';
+
+const BASE_PAGES: Record<string, string> = {
   at: 'run commands once at a later time. Pipe the command in: echo "cmd" | at now + 5 minutes',
   atq: 'list pending at jobs',
   atrm: 'remove an at job by number',
@@ -90,3 +94,5 @@ export const MAN_PAGES: Record<string, string> = {
   which: 'show the full path of a command',
   whoami: 'print the effective user name',
 };
+
+export const MAN_PAGES: Record<string, string> = { ...BASE_PAGES, ...STORAGE_MAN, ...KERNEL_MAN, ...SCRIPT_MAN };

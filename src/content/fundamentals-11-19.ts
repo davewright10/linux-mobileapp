@@ -1,3 +1,4 @@
+import { F11_STORAGE_LABS } from './labs-storage';
 import { Module, peek, ran } from './types';
 
 // Linux Fundamentals, Lessons 11–19. Original practice material.
@@ -94,6 +95,7 @@ export const F11: Module = {
         },
       ],
     },
+    ...F11_STORAGE_LABS,
   ],
 };
 

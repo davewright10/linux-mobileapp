@@ -15,6 +15,9 @@ import {
   splitPath,
 } from './fs';
 import { ADMIN_COMMANDS } from './commands-admin';
+import { KERNEL_COMMANDS, kernelDnf, kernelRpm, rebootSystem } from './commands-kernel';
+import { SCRIPT_COMMANDS } from './commands-script';
+import { STORAGE_COMMANDS } from './commands-storage';
 import { MAN_PAGES } from './manpages';
 import type { Shell } from './shell';
 import { AVAILABLE_PACKAGES, Group, User, pkgKey, pkgName } from './state';
@@ -1306,6 +1309,7 @@ const systemctl: Command = ({ sh, args }) => {
     case 'daemon-reload':
       return ok();
     case 'reboot':
+      return rebootSystem({ sh, args: [], stdin: '', name: 'reboot' });
     case 'poweroff':
       return ok(`(Practice server: pretending to ${verb}. Your changes are kept.)\n`);
   }
@@ -1360,7 +1364,10 @@ const systemctl: Command = ({ sh, args }) => {
   return { stdout: out, stderr: err, code };
 };
 
-const dnf: Command = ({ sh, args, name }) => {
+const dnf: Command = (ctx) => {
+  const kernel = kernelDnf(ctx);
+  if (kernel) return kernel;
+  const { sh, args, name } = ctx;
   const { operands } = getopts(args);
   const [verb, ...pkgs] = operands;
   const known = (p: string) => AVAILABLE_PACKAGES[pkgKey(p)];
@@ -1425,7 +1432,10 @@ const dnf: Command = ({ sh, args, name }) => {
   }
 };
 
-const rpm: Command = ({ sh, args }) => {
+const rpm: Command = (ctx) => {
+  const kernel = kernelRpm(ctx);
+  if (kernel) return kernel;
+  const { sh, args } = ctx;
   const { flags, operands } = getopts(args);
   if (flags.has('q') && flags.has('a')) return ok(sh.state.installed.map((p) => `${p}-1.0-1.el10.x86_64`).join('\n') + '\n');
   if (flags.has('q') && flags.has('f')) return ok('coreutils-9.5-6.el10.x86_64\n');
@@ -1670,4 +1680,7 @@ export const COMMANDS: Record<string, Command> = {
   history, clear, which, type: typeCmd, export: exportCmd, env, man, help,
   true: trueCmd, false: falseCmd, test, '[': test,
   ...ADMIN_COMMANDS,
+  ...STORAGE_COMMANDS,
+  ...KERNEL_COMMANDS,
+  ...SCRIPT_COMMANDS,
 };
