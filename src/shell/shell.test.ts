@@ -145,3 +145,11 @@ test('admin commands: nmcli, flatpak, processes, at, timers', () => {
   assert.equal(out(sh, 'tuned-adm active'), 'Current active profile: powersave\n');
   assert.match(out(sh, 'chronyc sources'), /2\.rhel\.pool\.ntp\.org/);
 });
+
+test('editing generated config files updates the system', () => {
+  const sh = new Shell();
+  out(sh, "sudo sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config");
+  assert.match(out(sh, 'sestatus'), /Mode from config file:\s+permissive/);
+  out(sh, 'echo web9.example.com | sudo tee /etc/hostname');
+  assert.equal(sh.prompt(), '[student@web9 ~]$ ');
+});

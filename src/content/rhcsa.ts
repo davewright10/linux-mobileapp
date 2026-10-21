@@ -1,4 +1,5 @@
 import { R10, R11, R12, R8, R9 } from './rhcsa-8-12';
+import { R1, R13, R14, R15, R16, R17, R18, R19, R20, R21, R22, R23, R24, R25, R26 } from './rhcsa-rest';
 import { Module, groupByName, groupOf, inGroup, ownerName, peek, permBits, ran, userByName } from './types';
 
 // Track 2 follows Sander van Vugt's "Red Hat RHCSA RHEL 10 with Exam Labs" video course and the
@@ -635,25 +636,7 @@ const R7: Module = {
   ],
 };
 
-const stub = (id: string, ref: string, title: string, summary: string): Module => ({
-  id, track: 'rhcsa', title, courseRef: ref, summary, quiz: [], cards: [], labs: [],
-});
-
 export const RHCSA: Module[] = [
-  stub('R1', 'Video Lessons 1–2 · Cert Guide Ch. 1', 'RHEL and installation', 'What RHEL 10 is, subscriptions, and installing a server.'),
-  R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12,
-  stub('R13', 'Video Lesson 17 · Cert Guide Ch. 13', 'Logging and the journal', 'journalctl, rsyslog, log rotation and a persistent journal.'),
-  stub('R14', 'Video Lesson 18 · Cert Guide Ch. 14', 'Partitions, file systems and mounts', 'GPT partitions, XFS, ext4 and VFAT, fstab by UUID or label, and swap.'),
-  stub('R15', 'Video Lesson 19 · Cert Guide Ch. 15', 'LVM', 'Physical volumes, volume groups and logical volumes, and extending them.'),
-  stub('R16', 'Video Lesson 20 · Cert Guide Ch. 17', 'Boot procedure and GRUB', 'Targets, GRUB 2 and modifying the boot loader.'),
-  stub('R17', 'Video Lesson 21 · Cert Guide Ch. 16', 'Kernel management', 'Kernel modules and updating the kernel.'),
-  stub('R18', 'Video Lesson 22 · Cert Guide Ch. 18', 'Troubleshooting and root password reset', 'Interrupting the boot, rescue mode, and fixing common issues.'),
-  stub('R19', 'Video Lesson 23 · Cert Guide Ch. 19', 'Bash scripting', 'if, test, for loops, script arguments and command output.'),
-  stub('R20', 'Video Lesson 24 · Cert Guide Ch. 20', 'SSH and key-based auth', 'Hardening sshd, key-based login, and secure file transfer.'),
-  stub('R21', 'Video Lesson 25 · Cert Guide Ch. 21', 'Apache HTTP', 'A basic web server, configuration files and virtual hosts.'),
-  stub('R22', 'Video Lesson 26 · Cert Guide Ch. 25', 'Time services', 'Time zones and chrony as a time client.'),
-  stub('R23', 'Video Lesson 27 · Cert Guide Ch. 22', 'SELinux', 'Modes, contexts, restorecon, port labels, booleans and troubleshooting.'),
-  stub('R24', 'Video Lesson 28 · Cert Guide Ch. 23', 'firewalld', 'Zones, services and ports with firewall-cmd.'),
-  stub('R25', 'Video Lesson 29 · Cert Guide Ch. 24', 'NFS and autofs', 'Mounting NFS shares and configuring autofs.'),
-  stub('R26', 'Video Lessons 30–32 · Cert Guide Ch. 26–27', 'Exam prep and mock exam', 'Exam tips and a timed, mixed practice exam.'),
+  R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13,
+  R14, R15, R16, R17, R18, R19, R20, R21, R22, R23, R24, R25, R26,
 ];
