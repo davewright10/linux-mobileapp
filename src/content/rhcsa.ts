@@ -1,3 +1,4 @@
+import { R10, R11, R12, R8, R9 } from './rhcsa-8-12';
 import { Module, groupByName, groupOf, inGroup, ownerName, peek, permBits, ran, userByName } from './types';
 
 // Track 2 follows Sander van Vugt's "Red Hat RHCSA RHEL 10 with Exam Labs" video course and the
@@ -640,12 +641,7 @@ const stub = (id: string, ref: string, title: string, summary: string): Module =
 
 export const RHCSA: Module[] = [
   stub('R1', 'Video Lessons 1–2 · Cert Guide Ch. 1', 'RHEL and installation', 'What RHEL 10 is, subscriptions, and installing a server.'),
-  R2, R3, R4, R5, R6, R7,
-  stub('R8', 'Video Lesson 11 · Cert Guide Ch. 8', 'Network configuration', 'IPv4 and IPv6 with nmcli and nmtui, host names and name resolution.'),
-  stub('R9', 'Video Lesson 12 · Cert Guide Ch. 9', 'Software: dnf, rpm and Flatpak', 'Repositories, installing and removing packages, and Flatpak (new for RHEL 10).'),
-  stub('R10', 'Video Lessons 13–14 · Cert Guide Ch. 10', 'Monitoring and processes', 'Finding heavy processes, kill, nice, and tuned profiles.'),
-  stub('R11', 'Video Lesson 15 · Cert Guide Ch. 11', 'systemd units and targets', 'Managing services and units, and booting into targets.'),
-  stub('R12', 'Video Lesson 16 · Cert Guide Ch. 12', 'Scheduling: cron, at and timers', 'Recurring and one-off jobs, and systemd timer units.'),
+  R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12,
   stub('R13', 'Video Lesson 17 · Cert Guide Ch. 13', 'Logging and the journal', 'journalctl, rsyslog, log rotation and a persistent journal.'),
   stub('R14', 'Video Lesson 18 · Cert Guide Ch. 14', 'Partitions, file systems and mounts', 'GPT partitions, XFS, ext4 and VFAT, fstab by UUID or label, and swap.'),
   stub('R15', 'Video Lesson 19 · Cert Guide Ch. 15', 'LVM', 'Physical volumes, volume groups and logical volumes, and extending them.'),

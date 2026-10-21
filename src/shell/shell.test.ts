@@ -110,3 +110,38 @@ test('tab completion', async () => {
   assert.equal(complete(sh, 'ls /et').line, 'ls /etc/');
   assert.deepEqual(complete(sh, 'cat /etc/ho').options, ['hostname', 'hosts']);
 });
+
+test('admin commands: nmcli, flatpak, processes, at, timers', () => {
+  const sh = new Shell();
+  assert.match(out(sh, 'nmcli con mod ens160 ipv4.addresses 10.0.0.5/24'), /Insufficient privileges/);
+  out(sh, 'sudo nmcli con mod ens160 +ipv4.addresses 10.0.0.5/24');
+  assert.doesNotMatch(out(sh, 'ip a'), /10\.0\.0\.5/);
+  out(sh, 'sudo nmcli con up ens160');
+  assert.match(out(sh, 'ip a'), /inet 10\.0\.0\.5\/24/);
+  assert.match(out(sh, 'sudo nmcli con mod ens160 ipv4.addresses 999.1.1.1/24'), /invalid IP address/);
+
+  assert.match(out(sh, 'sudo flatpak install flathub org.gnome.Calculator'), /No remote refs/);
+  out(sh, 'sudo flatpak remote-add flathub https://dl.flathub.org/repo/flathub.flatpakrepo');
+  out(sh, 'sudo flatpak install -y flathub org.gnome.Calculator');
+  assert.match(out(sh, 'flatpak list'), /org\.gnome\.Calculator/);
+
+  assert.match(out(sh, 'ps aux --sort=-%cpu').split('\n')[1], /dd if=/);
+  assert.match(out(sh, 'kill 1702'), /Operation not permitted/);
+  out(sh, 'kill 1650');
+  assert.doesNotMatch(out(sh, 'ps aux'), /dd if=/);
+  assert.match(out(sh, 'renice -n -5 -p 1602'), /Permission denied/);
+  out(sh, 'sudo renice -n 10 -p 1702');
+  assert.equal(sh.state.processes.find((p) => p.pid === 1702)?.nice, 10);
+
+  assert.match(out(sh, 'echo "touch /tmp/x" | at now + 5 minutes'), /job 1 at now \+ 5 minutes/);
+  assert.match(out(sh, 'atq'), /^1\t/);
+  out(sh, 'atrm 1');
+  assert.equal(out(sh, 'atq'), '');
+
+  out(sh, 'sudo systemctl enable --now fstrim.timer');
+  assert.match(out(sh, 'systemctl list-timers'), /fstrim\.timer\s+fstrim\.service/);
+  assert.match(out(sh, 'systemctl status fstrim.timer'), /● fstrim\.timer - /);
+  out(sh, 'sudo tuned-adm profile powersave');
+  assert.equal(out(sh, 'tuned-adm active'), 'Current active profile: powersave\n');
+  assert.match(out(sh, 'chronyc sources'), /2\.rhel\.pool\.ntp\.org/);
+});
