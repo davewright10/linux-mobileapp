@@ -1,3 +1,4 @@
+import { F11, F12, F13, F14, F15, F16, F17, F18, F19 } from './fundamentals-11-19';
 import { F10, F6, F7, F8, F9 } from './fundamentals-6-10';
 import { Module, peek, ran } from './types';
 
@@ -475,20 +476,8 @@ const F5: Module = {
   ],
 };
 
-const stub = (id: string, lesson: number, title: string, summary: string): Module => ({
-  id, track: 'fundamentals', title, courseRef: `Linux Fundamentals, Lesson ${lesson}`, summary, quiz: [], cards: [], labs: [],
-});
-
 export const FUNDAMENTALS: Module[] = [
   F1, F2, F3, F4, F5, F6, F7, F8, F9, F10,
-  stub('F11', 11, 'Storage essentials', 'Disks, partitions, file systems and mounting.'),
-  stub('F12', 12, 'Networking basics', 'IP addresses, ip, ping and host names.'),
-  stub('F13', 13, 'systemd and services', 'Starting, stopping and enabling services with systemctl.'),
-  stub('F14', 14, 'Managing software', 'Installing and removing packages with dnf.'),
-  stub('F15', 15, 'Managing SSH', 'Configuring the SSH server and using key-based login.'),
-  stub('F16', 16, 'Managing time', 'Time zones, the system clock and NTP.'),
-  stub('F17', 17, 'Processes', 'Viewing and controlling processes with ps, top and kill.'),
-  stub('F18', 18, 'Scheduling tasks', 'Running jobs later with cron, at and systemd timers.'),
-  stub('F19', 19, 'Reading log files', 'Finding answers in journald and /var/log.'),
+  F11, F12, F13, F14, F15, F16, F17, F18, F19,
 ];
 

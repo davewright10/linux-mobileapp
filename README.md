@@ -7,7 +7,7 @@ content is original and mapped to the public course outlines and Red Hat's EX200
 
 ## What's in it
 
-- **Two tracks**: Linux Fundamentals (F1–F19) and RHCSA (R1–R26). Modules F1–F10 and R2–R12 have
+- **Two tracks**: Linux Fundamentals (F1–F19) and RHCSA (R1–R26). Modules F1–F19 and R2–R12 have
   full content so far; the rest show as "coming soon".
 - **Quizzes** with an explanation for every answer. 80% passes a module.
 - **Flashcards** with simple spaced repetition (Leitner boxes), stored on the device.
@@ -58,7 +58,7 @@ npm run typecheck
 npx eslint src
 ```
 
-Content lives in `src/content/fundamentals.ts` and `src/content/rhcsa.ts`. Each lab task has a
+Content lives in `src/content/` (`fundamentals*.ts` and `rhcsa*.ts`). Each lab task has a
 `hint` (the command that solves it) and a `check` that inspects the simulated system; the content
 test runs every hint and asserts the check passes.
 
