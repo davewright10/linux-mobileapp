@@ -14,6 +14,7 @@ import {
   modeString,
   splitPath,
 } from './fs';
+import { ADMIN_COMMANDS } from './commands-admin';
 import { MAN_PAGES } from './manpages';
 import type { Shell } from './shell';
 import { AVAILABLE_PACKAGES, Group, User, pkgKey, pkgName } from './state';
@@ -1228,17 +1229,6 @@ const date: Command = () => ok(new Date().toString() + '\n');
 
 const uptime: Command = () => ok(' 15:42:07 up 3 days,  4:11,  1 user,  load average: 0.08, 0.03, 0.01\n');
 
-const ip: Command = ({ args }) => {
-  const sub = args[0] ?? '';
-  if (sub.startsWith('a')) {
-    return ok(
-      `1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n    inet6 ::1/128 scope host\n2: ens160: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000\n    link/ether 00:0c:29:3a:7b:1f brd ff:ff:ff:ff:ff:ff\n    inet 192.168.4.100/24 brd 192.168.4.255 scope global noprefixroute ens160\n    inet6 fe80::20c:29ff:fe3a:7b1f/64 scope link noprefixroute\n`,
-    );
-  }
-  if (sub.startsWith('r')) return ok('default via 192.168.4.1 dev ens160 proto static metric 100\n192.168.4.0/24 dev ens160 proto kernel scope link src 192.168.4.100 metric 100\n');
-  if (sub.startsWith('l')) return ok('1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN\n2: ens160: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP\n');
-  return fail('Usage: ip [ OPTIONS ] OBJECT { COMMAND | help }\nwhere  OBJECT := { address | link | route | ... }');
-};
 
 const ping: Command = ({ args }) => {
   const host = args.filter((a) => !a.startsWith('-') && !/^\d+$/.test(a)).pop();
@@ -1267,22 +1257,7 @@ const lsblk: Command = () =>
     'NAME          MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS\nnvme0n1       259:0    0   20G  0 disk\n├─nvme0n1p1   259:1    0  600M  0 part /boot/efi\n├─nvme0n1p2   259:2    0    1G  0 part /boot\n└─nvme0n1p3   259:3    0 18.4G  0 part\n  ├─rhel-root 253:0    0 16.4G  0 lvm  /\n  └─rhel-swap 253:1    0    2G  0 lvm  [SWAP]\nnvme0n2       259:4    0   10G  0 disk\n',
   );
 
-const ps: Command = ({ args }) => {
-  const full = args.some((a) => a.includes('aux') || a.includes('ef'));
-  if (!full) return ok('    PID TTY          TIME CMD\n   1602 pts/0    00:00:00 bash\n   1688 pts/0    00:00:00 ps\n');
-  return ok(
-    'USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nroot           1  0.0  0.4 108120 16840 ?        Ss   08:00   0:02 /usr/lib/systemd/systemd\nroot         790  0.0  0.1  84520  4120 ?        S    08:00   0:00 /usr/sbin/chronyd -F 2\nroot         812  0.0  0.5 253320 19200 ?        Ssl  08:00   0:01 /usr/sbin/NetworkManager --no-daemon\nroot         901  0.0  0.2  16080  8840 ?        Ss   08:00   0:00 sshd: /usr/sbin/sshd -D\nroot         955  0.0  0.1  12180  3420 ?        Ss   08:00   0:00 /usr/sbin/crond -n\nstudent     1602  0.0  0.1  10196  5520 pts/0    Ss   08:01   0:00 -bash\nstudent     1650 97.3  0.0   7180  1820 pts/0    R    08:30  12:04 dd if=/dev/zero of=/dev/null\nstudent     1688  0.0  0.1  11440  3780 pts/0    R+   15:42   0:00 ps aux\n',
-  );
-};
 
-const kill: Command = ({ args }) => {
-  const pids = args.filter((a) => /^\d+$/.test(a));
-  if (args[0] === '-l') return ok(' 1) SIGHUP\t 2) SIGINT\t 9) SIGKILL\t15) SIGTERM\t18) SIGCONT\t19) SIGSTOP\n');
-  if (!pids.length) return fail('kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]', 2);
-  const unknown = pids.filter((p) => !['1602', '1650', '790', '812', '901', '955'].includes(p));
-  if (unknown.length) return fail(`-bash: kill: (${unknown[0]}) - No such process`);
-  return ok();
-};
 
 // ---------- services, packages, security ----------
 
@@ -1290,6 +1265,7 @@ const systemctl: Command = ({ sh, args }) => {
   const { flags, operands } = getopts(args);
   const [verb, ...units] = operands;
   const svcName = (u: string) => u.replace(/\.service$/, '');
+  const unit = (n: string) => (n.includes('.') ? n : `${n}.service`);
   const get = (u: string) => sh.state.services[svcName(u)];
   const changes = ['start', 'stop', 'restart', 'reload', 'enable', 'disable', 'set-default', 'isolate', 'mask', 'unmask', 'daemon-reload'];
   if (changes.includes(verb ?? '') && sh.uid !== 0) {
@@ -1300,12 +1276,22 @@ const systemctl: Command = ({ sh, args }) => {
     case 'list-units': {
       const rows = Object.values(sh.state.services)
         .filter((s) => s.active || flags.has('all'))
-        .map((s) => `  ${(s.name + '.service').padEnd(30)} loaded ${s.active ? 'active   running' : 'inactive dead   '} ${s.description}`);
+        .map((s) => `  ${unit(s.name).padEnd(30)} loaded ${s.active ? 'active   running' : 'inactive dead   '} ${s.description}`);
       return ok(`  UNIT                           LOAD   ACTIVE   SUB     DESCRIPTION\n${rows.join('\n')}\n\n${rows.length} loaded units listed.\n`);
     }
     case 'list-unit-files': {
-      const rows = Object.values(sh.state.services).map((s) => `${(s.name + '.service').padEnd(32)} ${s.enabled ? 'enabled ' : 'disabled'} disabled`);
+      const rows = Object.values(sh.state.services).map((s) => `${unit(s.name).padEnd(32)} ${s.enabled ? 'enabled ' : 'disabled'} disabled`);
       return ok(`UNIT FILE                        STATE    PRESET\n${rows.join('\n')}\n`);
+    }
+    case 'list-timers': {
+      const timers = Object.values(sh.state.services).filter((s) => s.name.endsWith('.timer') && (s.active || flags.has('all')));
+      return ok('NEXT                        LEFT     LAST                        PASSED  UNIT                     ACTIVATES\n' + timers.map((t) => `Wed 2026-10-22 00:00:00 UTC 8h left  Tue 2026-10-21 00:00:00 UTC 15h ago ${t.name.padEnd(24)} ${t.name.replace('.timer', '.service')}`).join('\n') + `\n\n${timers.length} timers listed.\n`);
+    }
+    case 'cat': {
+      const s = get(units[0] ?? '');
+      if (!s) return fail(`No files found for ${units[0]}.`);
+      if (s.name.endsWith('.timer')) return ok(`# /usr/lib/systemd/system/${s.name}\n[Unit]\nDescription=${s.description}\n\n[Timer]\nOnCalendar=weekly\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n`);
+      return ok(`# /usr/lib/systemd/system/${unit(s.name)}\n[Unit]\nDescription=${s.description}\n\n[Service]\nExecStart=/usr/sbin/${s.name}\n\n[Install]\nWantedBy=multi-user.target\n`);
     }
     case 'get-default':
       return ok(sh.state.defaultTarget + '\n');
@@ -1346,12 +1332,12 @@ const systemctl: Command = ({ sh, args }) => {
         s.active = false;
         break;
       case 'enable':
-        if (!s.enabled) err += `Created symlink '/etc/systemd/system/multi-user.target.wants/${s.name}.service' → '/usr/lib/systemd/system/${s.name}.service'.\n`;
+        if (!s.enabled) err += `Created symlink '/etc/systemd/system/${s.name.endsWith('.timer') ? 'timers' : 'multi-user'}.target.wants/${unit(s.name)}' → '/usr/lib/systemd/system/${unit(s.name)}'.\n`;
         s.enabled = true;
         if (flags.has('now')) s.active = true;
         break;
       case 'disable':
-        if (s.enabled) err += `Removed '/etc/systemd/system/multi-user.target.wants/${s.name}.service'.\n`;
+        if (s.enabled) err += `Removed '/etc/systemd/system/${s.name.endsWith('.timer') ? 'timers' : 'multi-user'}.target.wants/${unit(s.name)}'.\n`;
         s.enabled = false;
         if (flags.has('now')) s.active = false;
         break;
@@ -1364,7 +1350,7 @@ const systemctl: Command = ({ sh, args }) => {
         if (!s.enabled) code = 1;
         break;
       case 'status':
-        out += `${s.active ? '●' : '○'} ${s.name}.service - ${s.description}\n     Loaded: loaded (/usr/lib/systemd/system/${s.name}.service; ${s.enabled ? 'enabled' : 'disabled'}; preset: disabled)\n     Active: ${s.active ? 'active (running) since Tue 2026-10-21 08:00:04 UTC' : 'inactive (dead)'}\n`;
+        out += `${s.active ? '●' : '○'} ${unit(s.name)} - ${s.description}\n     Loaded: loaded (/usr/lib/systemd/system/${unit(s.name)}; ${s.enabled ? 'enabled' : 'disabled'}; preset: disabled)\n     Active: ${s.active ? 'active (running) since Tue 2026-10-21 08:00:04 UTC' : 'inactive (dead)'}\n`;
         if (!s.active) code = 3;
         break;
       default:
@@ -1678,9 +1664,10 @@ export const COMMANDS: Record<string, Command> = {
   tar, gzip: compressCmd('.gz', false), gunzip: compressCmd('.gz', true), bzip2: compressCmd('.bz2', false), bunzip2: compressCmd('.bz2', true),
   whoami, id, groups: groupsCmd, useradd, usermod, userdel, groupadd, groupdel, groupmod, gpasswd, passwd, chage,
   chmod, chown, chgrp: chown, umask, sudo, su, exit, logout: exit,
-  hostname, hostnamectl, uname, date, uptime, ip, ping, df, free, lsblk, ps, kill,
+  hostname, hostnamectl, uname, date, uptime, ping, df, free, lsblk,
   systemctl, dnf, yum: dnf, rpm, getenforce, setenforce, sestatus, 'firewall-cmd': firewallCmd,
   journalctl, crontab,
   history, clear, which, type: typeCmd, export: exportCmd, env, man, help,
   true: trueCmd, false: falseCmd, test, '[': test,
+  ...ADMIN_COMMANDS,
 };

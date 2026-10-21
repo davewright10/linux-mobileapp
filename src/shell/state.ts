@@ -28,6 +28,31 @@ export interface Service {
   installedBy?: string; // package that provides it
 }
 
+export interface NmConnection {
+  name: string;
+  device: string;
+  autoconnect: boolean;
+  ipv4: { method: 'auto' | 'manual' | 'disabled'; addresses: string[]; gateway: string; dns: string[] };
+  ipv6: { method: 'auto' | 'manual' | 'disabled' | 'ignore'; addresses: string[]; gateway: string };
+  applied: { ipv4: string[]; ipv6: string[] }; // what `ip a` shows after `nmcli con up`
+}
+
+export interface Process {
+  pid: number;
+  user: string;
+  cpu: number;
+  mem: number;
+  nice: number;
+  cmd: string;
+}
+
+export interface AtJob {
+  id: number;
+  when: string;
+  user: string;
+  cmd: string;
+}
+
 export interface SystemState {
   hostname: string;
   root: FsNode;
@@ -39,7 +64,33 @@ export interface SystemState {
   selinuxConfigMode: 'enforcing' | 'permissive' | 'disabled';
   firewall: { services: string[]; ports: string[]; permServices: string[]; permPorts: string[] };
   defaultTarget: string;
+  connections: NmConnection[];
+  flatpakRemotes: string[];
+  flatpakApps: string[];
+  tunedProfile: string;
+  processes: Process[];
+  atJobs: AtJob[];
+  timezone: string;
+  ntp: boolean;
 }
+
+export const FLATPAK_APPS: Record<string, string> = {
+  'org.gnome.Calculator': 'Calculator',
+  'org.gnome.TextEditor': 'Text Editor',
+  'org.mozilla.firefox': 'Firefox',
+  'org.libreoffice.LibreOffice': 'LibreOffice',
+};
+
+export const TUNED_PROFILES: Record<string, string> = {
+  balanced: 'General non-specialized tuned profile',
+  'desktop': 'Optimize for the desktop use-case',
+  'latency-performance': 'Optimize for deterministic performance at the cost of increased power consumption',
+  'network-latency': 'Optimize for deterministic performance at the cost of increased power consumption, focused on low latency network performance',
+  powersave: 'Optimize for low power consumption',
+  'throughput-performance': 'Broadly applicable tuning that provides excellent performance across a variety of common server workloads',
+  'virtual-guest': 'Optimize for running inside a virtual guest',
+  'virtual-host': 'Optimize for running KVM guests',
+};
 
 export const AVAILABLE_PACKAGES: Record<string, { summary: string; service?: string; version: string }> = {
   httpd: { summary: 'Apache HTTP Server', service: 'httpd', version: '2.4.63-1.el10' },
@@ -123,6 +174,7 @@ function etcFiles(root: FsNode) {
   add('os-release', OS_RELEASE);
   add('redhat-release', 'Red Hat Enterprise Linux release 10.0 (Coughlan)\n');
   add('fstab', '/dev/mapper/rhel-root   /       xfs     defaults        0 0\nUUID=4c8a1e2b-7f3d-4a8e-9c1b-2d5e6f7a8b9c /boot xfs defaults 0 0\n/dev/mapper/rhel-swap   none    swap    defaults        0 0\n');
+  add('chrony.conf', '# Use public servers from the pool.ntp.org project.\npool 2.rhel.pool.ntp.org iburst\ndriftfile /var/lib/chrony/drift\nmakestep 1.0 3\nrtcsync\nlogdir /var/log/chrony\n');
   add('resolv.conf', 'search example.com\nnameserver 192.168.4.1\n');
   add('login.defs', 'PASS_MAX_DAYS\t99999\nPASS_MIN_DAYS\t0\nPASS_WARN_AGE\t7\nUID_MIN\t\t1000\nGID_MIN\t\t1000\nCREATE_HOME\tyes\nUMASK\t\t022\n');
   add('sudoers', '## Allows people in group wheel to run all commands\n%wheel\tALL=(ALL)\tALL\n', 0o440);
@@ -210,11 +262,40 @@ export function createInitialState(): SystemState {
       'systemd-journald': { name: 'systemd-journald', description: 'Journal Service', active: true, enabled: true },
       rsyslog: { name: 'rsyslog', description: 'System Logging Service', active: true, enabled: true },
       tuned: { name: 'tuned', description: 'Dynamic System Tuning Daemon', active: true, enabled: true },
+      'fstrim.timer': { name: 'fstrim.timer', description: 'Discard unused filesystem blocks once a week', active: false, enabled: false },
+      'dnf-makecache.timer': { name: 'dnf-makecache.timer', description: 'dnf makecache --timer', active: true, enabled: true },
+      'logrotate.timer': { name: 'logrotate.timer', description: 'Daily rotation of log files', active: true, enabled: true },
     },
     installed: ['bash', 'coreutils', 'openssh-server', 'chrony', 'firewalld', 'vim-minimal', 'dnf', 'tuned', 'policycoreutils'],
     selinux: 'Enforcing',
     selinuxConfigMode: 'enforcing',
     firewall: { services: ['cockpit', 'dhcpv6-client', 'ssh'], ports: [], permServices: ['cockpit', 'dhcpv6-client', 'ssh'], permPorts: [] },
     defaultTarget: 'multi-user.target',
+    connections: [
+      {
+        name: 'ens160',
+        device: 'ens160',
+        autoconnect: true,
+        ipv4: { method: 'manual', addresses: ['192.168.4.100/24'], gateway: '192.168.4.1', dns: ['192.168.4.1'] },
+        ipv6: { method: 'auto', addresses: [], gateway: '' },
+        applied: { ipv4: ['192.168.4.100/24'], ipv6: [] },
+      },
+    ],
+    flatpakRemotes: ['rhel'],
+    flatpakApps: [],
+    tunedProfile: 'virtual-guest',
+    processes: [
+      { pid: 1, user: 'root', cpu: 0.0, mem: 0.4, nice: 0, cmd: '/usr/lib/systemd/systemd --switched-root --system' },
+      { pid: 790, user: 'chrony', cpu: 0.0, mem: 0.1, nice: 0, cmd: '/usr/sbin/chronyd -F 2' },
+      { pid: 812, user: 'root', cpu: 0.0, mem: 0.5, nice: 0, cmd: '/usr/sbin/NetworkManager --no-daemon' },
+      { pid: 901, user: 'root', cpu: 0.0, mem: 0.2, nice: 0, cmd: 'sshd: /usr/sbin/sshd -D' },
+      { pid: 955, user: 'root', cpu: 0.0, mem: 0.1, nice: 0, cmd: '/usr/sbin/crond -n' },
+      { pid: 1602, user: 'student', cpu: 0.0, mem: 0.1, nice: 0, cmd: '-bash' },
+      { pid: 1650, user: 'student', cpu: 97.3, mem: 0.0, nice: 0, cmd: 'dd if=/dev/zero of=/dev/null' },
+      { pid: 1702, user: 'root', cpu: 1.2, mem: 31.4, nice: 0, cmd: '/usr/local/bin/memhog --size 1G' },
+    ],
+    atJobs: [],
+    timezone: 'America/New_York',
+    ntp: true,
   };
 }

@@ -7,13 +7,13 @@ content is original and mapped to the public course outlines and Red Hat's EX200
 
 ## What's in it
 
-- **Two tracks**: Linux Fundamentals (F1–F19) and RHCSA (R1–R26). Modules F1–F5 and R2–R7 have
+- **Two tracks**: Linux Fundamentals (F1–F19) and RHCSA (R1–R26). Modules F1–F10 and R2–R12 have
   full content so far; the rest show as "coming soon".
 - **Quizzes** with an explanation for every answer. 80% passes a module.
 - **Flashcards** with simple spaced repetition (Leitner boxes), stored on the device.
 - **Practice terminal**: a simulated RHEL 10 server (`src/shell/`) that runs fully offline, with
-  ~100 commands, pipes, redirection, users/groups, permissions, sudo, systemctl, dnf, firewall-cmd,
-  SELinux mode, tar and more. **Labs** give exam-style tasks and check the system state as you go.
+  ~120 commands, pipes, redirection, users/groups, permissions, sudo, systemctl (incl. timers), dnf,
+  Flatpak, nmcli, ps/kill/renice, tuned-adm, cron and at, firewall-cmd, SELinux mode, tar and more. **Labs** give exam-style tasks and check the system state as you go.
 - **AI tutor** powered by Claude through a small backend (`backend/`), so the API key never ships
   in the app. Without a backend configured, the tutor answers offline from the app's flashcards.
 

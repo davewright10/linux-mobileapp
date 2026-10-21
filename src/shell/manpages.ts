@@ -1,5 +1,17 @@
 // Short one-line summaries shown by `man` and `man -k` in the practice terminal.
 export const MAN_PAGES: Record<string, string> = {
+  at: 'run commands once at a later time. Pipe the command in: echo "cmd" | at now + 5 minutes',
+  atq: 'list pending at jobs',
+  atrm: 'remove an at job by number',
+  chronyc: 'command-line interface for chrony. chronyc sources shows time servers',
+  flatpak: 'install and run Flatpak apps. remotes, remote-add, search, install, list, uninstall',
+  nice: 'run a program with a changed priority. nice -n 10 cmd (higher = nicer = lower priority)',
+  nmcli: 'NetworkManager command line. nmcli con show, nmcli con mod NAME ipv4.addresses ..., nmcli con up NAME',
+  pkill: 'signal processes by name',
+  renice: 'change the priority of a running process. renice -n 5 -p PID',
+  timedatectl: 'show or set time zone and NTP. timedatectl set-timezone Europe/Amsterdam',
+  top: 'show processes using the most CPU. In real top: k kills, r renices, q quits',
+  'tuned-adm': 'manage tuning profiles. tuned-adm active, list, recommend, profile NAME',
   awk: 'pattern scanning and processing language. Try: awk -F: \'{ print $1 }\' /etc/passwd',
   bunzip2: 'decompress .bz2 files',
   bzip2: 'compress files with the bzip2 algorithm',
