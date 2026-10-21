@@ -1,0 +1,14 @@
+name = "linux-study-tutor"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+MODEL = "claude-opus-5-5"
+DAILY_LIMIT = "50"
+
+# Optional daily cap per device. Create with: npx wrangler kv namespace create RATE
+# then uncomment and paste the id.
+# [[kv_namespaces]]
+# binding = "RATE"
+# id = "<your-kv-id>"

@@ -1,13 +1,14 @@
 {
   "expo": {
-    "name": "linux-study-app",
+    "name": "Linux Study",
     "slug": "linux-study-app",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.linuxstudy.app"
     },
     "android": {
       "adaptiveIcon": {
@@ -20,6 +21,14 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      "expo-router"
+    ],
+    "scheme": "linuxstudy",
+    "experiments": {
+      "typedRoutes": false
+    },
+    "backgroundColor": "#0f1419"
   }
 }
