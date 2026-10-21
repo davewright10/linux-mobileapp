@@ -64,7 +64,7 @@ export const F11: Module = {
     { front: 'mount -a', back: 'Mount everything in /etc/fstab that is not mounted yet. Use it to test fstab before rebooting.' },
     { front: 'blkid', back: 'Show the UUID and type of each file system.' },
     { front: 'mkfs.xfs /dev/sdb1', back: 'Create an XFS file system on a partition. This erases what was there.' },
-    { front: 'Partition tools', back: 'fdisk or gdisk for interactive use, parted for scripting.' },
+    { front: 'Partition tools', back: 'fdisk for interactive use, parted for scripting. Both handle MBR and GPT.' },
   ],
   labs: [
     {
@@ -795,7 +795,7 @@ export const F19: Module = {
     { front: '/var/log/messages', back: 'General system log (written by rsyslog).' },
     { front: '/var/log/secure', back: 'Logins, sudo and SSH authentication.' },
     { front: 'tail -f file', back: 'Watch a log file grow.' },
-    { front: 'Persistent journal', back: 'mkdir /var/log/journal (or Storage=persistent in journald.conf) to keep logs across reboots.' },
+    { front: 'Persistent journal', back: 'mkdir /var/log/journal and restart systemd-journald to keep logs across reboots.' },
   ],
   labs: [
     {

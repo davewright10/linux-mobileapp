@@ -31,9 +31,9 @@ export const R1: Module = {
     },
     {
       q: 'Which software selection gives you a small server without a graphical desktop?',
-      choices: ['Server with GUI', 'Minimal Install', 'Workstation', 'Custom Operating System'],
+      choices: ['Server with GUI', 'Minimal Install', 'Workstation'],
       answer: 1,
-      why: 'Minimal Install has the basics. You add what you need with dnf later.',
+      why: 'Minimal Install has the basics. You add what you need with dnf later. Server with GUI and Workstation both include a desktop.',
     },
     {
       q: 'Which tool registers a system with Red Hat so it can get updates?',
@@ -112,7 +112,7 @@ export const R13: Module = {
     },
   ],
   cards: [
-    { front: 'Persistent journal', back: 'mkdir /var/log/journal, then systemctl restart systemd-journald (or Storage=persistent in /etc/systemd/journald.conf).' },
+    { front: 'Persistent journal', back: 'mkdir /var/log/journal, systemctl restart systemd-journald, then journalctl --flush. Or create /etc/systemd/journald.conf with a [Journal] line and Storage=persistent (on RHEL 10 that file does not exist until you make it).' },
     { front: 'journalctl -b -1', back: 'Messages from the previous boot.' },
     { front: 'journalctl --since / --until', back: 'Messages in a time range.' },
     { front: 'journalctl _PID=1234', back: 'Messages from one process. Tab completion shows other fields.' },
@@ -206,7 +206,7 @@ export const R14: Module = {
   ],
   cards: [
     { front: 'MBR vs GPT', back: 'MBR: 2 TiB, 4 primary partitions. GPT: huge disks, 128 partitions.' },
-    { front: 'fdisk / gdisk / parted', back: 'Partition tools. parted can be scripted: parted /dev/sdb mkpart …' },
+    { front: 'fdisk / parted', back: 'Partition tools. Both handle MBR and GPT. parted can be scripted: parted /dev/sdb mkpart … (gdisk is not in the RHEL 10 repositories.)' },
     { front: 'mkfs.xfs / mkfs.ext4 / mkfs.vfat', back: 'Create a file system.' },
     { front: 'mkswap /dev/sdb2 ; swapon /dev/sdb2', back: 'Prepare and activate swap. swapon -s shows active swap.' },
     { front: 'blkid / lsblk -f', back: 'Show UUID, label and type.' },
@@ -301,7 +301,7 @@ export const R16: Module = {
       q: 'Which file holds the kernel arguments you change permanently with an editor?',
       choices: ['/etc/default/grub (GRUB_CMDLINE_LINUX)', '/boot/grub2/grub.cfg', '/etc/grub.conf', '/proc/cmdline'],
       answer: 0,
-      why: 'Never edit grub.cfg by hand. Change /etc/default/grub, then regenerate with grub2-mkconfig -o /boot/grub2/grub.cfg.',
+      why: 'Never edit grub.cfg by hand. Change /etc/default/grub, then run grub2-mkconfig -o /boot/grub2/grub.cfg --update-bls-cmdline. Without --update-bls-cmdline, RHEL 10 keeps the old kernel arguments.',
     },
     {
       q: 'How do you change kernel arguments for one boot only?',
@@ -328,7 +328,7 @@ export const R16: Module = {
     { front: 'systemctl isolate rescue.target', back: 'Switch to another target now.' },
     { front: 'multi-user vs graphical', back: 'Text mode server / with a graphical login.' },
     { front: '/etc/default/grub', back: 'GRUB settings: GRUB_TIMEOUT, GRUB_CMDLINE_LINUX.' },
-    { front: 'grub2-mkconfig -o /boot/grub2/grub.cfg', back: 'Write the GRUB configuration after editing /etc/default/grub.' },
+    { front: 'grub2-mkconfig -o /boot/grub2/grub.cfg', back: 'Write the GRUB configuration after editing /etc/default/grub. Add --update-bls-cmdline if you changed GRUB_CMDLINE_LINUX.' },
     { front: 'grubby --update-kernel=ALL --args=quiet', back: 'Add a kernel argument to all kernels.' },
     { front: 'GRUB menu: e, then Ctrl+X', back: 'Edit boot options once and boot.' },
     { front: '/proc/cmdline', back: 'The kernel arguments used for the current boot.' },
@@ -451,13 +451,13 @@ export const R18: Module = {
       q: 'A typo in /etc/fstab stops the server from booting. Where do you end up?',
       choices: ['Emergency mode, where you log in as root and fix fstab', 'The GRUB shell', 'A graphical error screen', 'The installer'],
       answer: 0,
-      why: 'Enter the root password, remount / read-write if needed, fix the line, then reboot. Always test fstab with mount -a first.',
+      why: 'Enter the root password, remount / read-write if needed, fix the line, then reboot. If the root account is locked (the RHEL 10 installer default), you get no shell there; boot with rd.break or init=/bin/bash instead. Always test fstab with mount -a first.',
     },
     {
       q: 'How do you finish the init=/bin/bash procedure so the system boots normally?',
-      choices: ['exec /usr/lib/systemd/systemd', 'exit', 'Ctrl+C', 'reboot -f twice'],
+      choices: ['exec /usr/lib/systemd/systemd', 'exit', 'Ctrl+C', 'reboot'],
       answer: 0,
-      why: 'bash replaces itself with systemd, which continues the normal boot. Rebooting from there is not possible because systemd is not running yet.',
+      why: 'bash replaces itself with systemd, which continues the normal boot. A plain reboot does not work there, because systemd is not running yet.',
     },
   ],
   cards: [
@@ -468,7 +468,7 @@ export const R18: Module = {
     { front: 'systemd.unit=rescue.target', back: 'Root shell with file systems mounted, few services.' },
     { front: 'Broken fstab', back: 'Emergency mode: log in, mount -o remount,rw /, fix fstab, reboot.' },
     { front: 'Boot an older kernel', back: 'Pick it in the GRUB menu if a new kernel fails.' },
-    { front: 'journalctl -xb', back: 'Errors of this boot, with extra explanation.' },
+    { front: 'journalctl -xb', back: 'All messages of this boot, with extra explanation where available. Add -p err for errors only.' },
   ],
   labs: [],
 };
@@ -499,7 +499,7 @@ export const R19: Module = {
       why: '0 means success. Anything else means something went wrong.',
     },
     {
-      q: 'Which test is true if /etc/hosts is a regular file?',
+      q: 'Which test checks whether /etc/hosts is a regular file?',
       choices: ['[ -f /etc/hosts ]', '[ -d /etc/hosts ]', '[ -z /etc/hosts ]', '[ /etc/hosts ]'],
       answer: 0,
       why: '-f file, -d directory, -e exists, -z empty string, -n non-empty string.',
@@ -582,7 +582,7 @@ export const R20: Module = {
     { front: 'ssh-copy-id user@host', back: 'Install your public key on a server.' },
     { front: 'ssh-agent / ssh-add', back: 'Cache your unlocked key for the session.' },
     { front: '/etc/ssh/sshd_config.d/', back: 'Drop-in server settings. First value read wins.' },
-    { front: 'New SSH port', back: 'Port line + semanage port -a -t ssh_port_t -p tcp N + firewall-cmd --add-port=N/tcp --permanent.' },
+    { front: 'New SSH port', back: 'Port line + semanage port -a -t ssh_port_t -p tcp N + firewall-cmd --add-port=N/tcp --permanent, then firewall-cmd --reload and systemctl restart sshd.' },
     { front: 'AllowUsers anna bob', back: 'Only these users may log in over SSH.' },
     { front: 'scp -r dir host:/path', back: 'Copy a directory over SSH.' },
     { front: 'rsync -av src host:/dest', back: 'Sync files over SSH, only what changed.' },
@@ -592,7 +592,7 @@ export const R20: Module = {
     {
       id: 'R20-sshd',
       title: 'Lock down SSH with a drop-in file',
-      intro: 'Put your sshd settings in their own file under /etc/ssh/sshd_config.d, where package updates will not touch them.',
+      intro: 'Put your sshd settings in their own file under /etc/ssh/sshd_config.d, where package updates will not touch them. Files there are read in name order and the first value wins, so check for lower-numbered files (the installer may create 01-permitrootlogin.conf). On a real server, sudo sshd -T shows the settings in effect.',
       tasks: [
         {
           text: 'Create /etc/ssh/sshd_config.d/50-exam.conf with the line PermitRootLogin no.',
@@ -804,10 +804,10 @@ export const R23: Module = {
       why: '-Z works for ps and id too.',
     },
     {
-      q: 'Apache must listen on port 8008. What SELinux command allows that?',
-      choices: ['semanage port -a -t http_port_t -p tcp 8008', 'setsebool httpd_8008 on', 'restorecon -p 8008', 'chcon -p 8008'],
+      q: 'Apache must listen on port 8888. What SELinux command allows that?',
+      choices: ['semanage port -a -t http_port_t -p tcp 8888', 'setsebool httpd_8888 on', 'restorecon -p 8888', 'chcon -p 8888'],
       answer: 0,
-      why: 'Services may only bind to ports with the right type. semanage port -l shows the current list.',
+      why: 'Services may only bind to ports with the right type. Check first with semanage port -l | grep http: ports such as 80, 443, 8008 and 8443 already have http_port_t, and Apache may also use 8080.',
     },
     {
       q: 'How do you turn on the boolean httpd_enable_homedirs permanently?',
@@ -834,7 +834,7 @@ export const R23: Module = {
     { front: 'ls -Z / ps -Z', back: 'Show SELinux contexts.' },
     { front: 'semanage fcontext -a -t TYPE "/dir(/.*)?"', back: 'Store a file context rule.' },
     { front: 'restorecon -Rv /dir', back: 'Apply the stored contexts to files.' },
-    { front: 'semanage port -a -t http_port_t -p tcp 8080', back: 'Allow a service type on a new port.' },
+    { front: 'semanage port -a -t http_port_t -p tcp 8888', back: 'Label a new port so Apache may use it. Check semanage port -l first; the port may already have a label.' },
     { front: 'setsebool -P name on', back: 'Turn on a boolean permanently.' },
     { front: 'getsebool -a', back: 'List all booleans and their state.' },
     { front: 'ausearch -m AVC', back: 'Find SELinux denials in the audit log.' },
@@ -1003,7 +1003,7 @@ export const R25: Module = {
       q: 'After changing autofs maps, what do you do?',
       choices: ['systemctl restart autofs (and enable it if not done)', 'mount -a', 'reboot', 'exportfs -r'],
       answer: 0,
-      why: 'autofs reads its maps at start.',
+      why: 'Changes to /etc/auto.master (or /etc/auto.master.d/) need a restart or reload. Edits to an indirect map like /etc/auto.shares work right away, but restarting is a safe habit.',
     },
   ],
   cards: [

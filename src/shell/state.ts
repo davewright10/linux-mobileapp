@@ -191,7 +191,6 @@ function etcFiles(root: FsNode) {
   add('logrotate.conf', 'weekly\nrotate 4\ncreate\ndateext\ninclude /etc/logrotate.d\n');
   etc.children!['logrotate.d'] = makeDir();
   const systemd = makeDir();
-  systemd.children!['journald.conf'] = makeFile('[Journal]\n#Storage=auto\n#Compress=yes\n#SystemMaxUse=\n');
   systemd.children!.system = makeDir();
   etc.children!.systemd = systemd;
   etc.children!['skel'] = makeDir();
