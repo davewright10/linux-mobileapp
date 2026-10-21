@@ -1,3 +1,4 @@
+import { F10, F6, F7, F8, F9 } from './fundamentals-6-10';
 import { Module, peek, ran } from './types';
 
 // Track 1 follows the lesson order of Sander van Vugt's "Linux Fundamentals, 2nd Edition".
@@ -479,12 +480,7 @@ const stub = (id: string, lesson: number, title: string, summary: string): Modul
 });
 
 export const FUNDAMENTALS: Module[] = [
-  F1, F2, F3, F4, F5,
-  stub('F6', 6, 'Text processing', 'Regular expressions, cut, sort, tr, and an introduction to awk and sed.'),
-  stub('F7', 7, 'Connecting to a server', 'Consoles, terminals and connecting with ssh and scp.'),
-  stub('F8', 8, 'The Bash shell', 'Redirection, pipes, variables, history and shell startup files.'),
-  stub('F9', 9, 'Users and groups', 'User accounts, groups, /etc/passwd and /etc/group.'),
-  stub('F10', 10, 'Permissions', 'Ownership, read/write/execute and changing them with chmod and chown.'),
+  F1, F2, F3, F4, F5, F6, F7, F8, F9, F10,
   stub('F11', 11, 'Storage essentials', 'Disks, partitions, file systems and mounting.'),
   stub('F12', 12, 'Networking basics', 'IP addresses, ip, ping and host names.'),
   stub('F13', 13, 'systemd and services', 'Starting, stopping and enabling services with systemctl.'),
