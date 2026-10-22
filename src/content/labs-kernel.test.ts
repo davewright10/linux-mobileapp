@@ -242,6 +242,15 @@ test('R17-kernel-update: dnf install kernel works as well, and the old kernel st
   assert.equal(defaultBootEntry(sh.state)?.version, UPDATE_KERNEL);
 });
 
+test('R17-kernel-update: the kernel list must come after the install, by rpm or by dnf', () => {
+  const { sh, l } = start('R17-kernel-update');
+  out(sh, 'rpm -q kernel');
+  out(sh, 'sudo dnf update -y kernel');
+  assert.equal(done(sh, l, 3), false, 'rpm -q kernel before the install does not count');
+  out(sh, 'sudo dnf list installed kernel');
+  assert.equal(done(sh, l, 3), true);
+});
+
 // ---------- R18-fstab ----------
 
 test('R18-fstab: the setup leaves /data mounted with a typo in its fstab line', () => {

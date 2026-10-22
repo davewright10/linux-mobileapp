@@ -68,4 +68,26 @@ export const permBits = (n: FsNode | null) => (n ? n.mode & 0o7777 : -1);
 export const ownerName = (sh: Shell, n: FsNode | null) => sh.state.users.find((u) => u.uid === n?.uid)?.name;
 export const groupOf = (sh: Shell, n: FsNode | null) => sh.state.groups.find((g) => g.gid === n?.gid)?.name;
 /** True if the user typed a command starting with `prefix` at some point. */
-export const ran = (sh: Shell, re: RegExp) => sh.history.some((h) => re.test(h));
+/** The commands of one history entry: its first line split at ; && || and |, each also without a leading sudo. */
+function commandsOf(entry: string): string[] {
+  return entry
+    .split('\n')[0]
+    .split(/&&|\|\||[;|]/)
+    .map((c) => c.trim())
+    .flatMap((c) => {
+      const bare = c.replace(/^sudo\s+(?=[^-\s])/, '');
+      return bare === c ? [c] : [c, bare];
+    });
+}
+
+/** True if something typed matches `re`: a whole history entry, or one command in it, with or without sudo. */
+export const ran = (sh: Shell, re: RegExp) => sh.history.some((h) => re.test(h) || commandsOf(h).some((c) => re.test(c)));
+
+/** Like ran, but only what was typed after the last entry that matches `after`. */
+export function ranAfter(sh: Shell, after: RegExp, re: RegExp): boolean {
+  let last = -1;
+  sh.history.forEach((h, i) => {
+    if (after.test(h) || commandsOf(h).some((c) => after.test(c))) last = i;
+  });
+  return last >= 0 && sh.history.slice(last + 1).some((h) => re.test(h) || commandsOf(h).some((c) => re.test(c)));
+}

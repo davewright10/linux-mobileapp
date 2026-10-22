@@ -15,7 +15,7 @@ import {
 } from '@/shell/kernel-state';
 import type { Shell } from '@/shell/shell';
 import { fsOn, fstabCheck, fstabFor, mountedAt, syncDev } from '@/shell/storage-state';
-import { Lab, ran } from './types';
+import { Lab, ran, ranAfter } from './types';
 
 // Labs that use kernels, modules, GRUB and the boot process.
 
@@ -23,13 +23,7 @@ import { Lab, ran } from './types';
 const REBOOT = /(^|[\s;&|(])(reboot|shutdown\s+(-\S*r|--reboot))\b/;
 
 /** True if a command matching `re` was typed after the last reboot command, e.g. a check of /proc/cmdline. */
-function ranAfterReboot(sh: Shell, re: RegExp): boolean {
-  let last = -1;
-  sh.history.forEach((h, i) => {
-    if (REBOOT.test(h)) last = i;
-  });
-  return last >= 0 && sh.history.slice(last + 1).some((h) => re.test(h));
-}
+const ranAfterReboot = (sh: Shell, re: RegExp) => ranAfter(sh, REBOOT, re);
 
 /** Run setup commands as the student would, then forget them so they do not count for ran(). */
 function quietly(sh: Shell, lines: string[]): void {
@@ -105,6 +99,10 @@ export const R16_BOOT_LABS: Lab[] = [
 // ---------- R17: kernel management ----------
 
 const UNAME_R = /^uname\s+(-\S*[ra]|--kernel-release|--all)/;
+/** dnf or yum installing or updating packages. */
+const DNF_INSTALL = /^(dnf|yum)\s.*\b(install|update|upgrade)\b/;
+/** rpm -q kernel, rpm -qa | grep kernel, dnf list installed kernel. */
+const LIST_KERNELS = /^(rpm\s+-q\S*\s.*\bkernel\b|(dnf|yum)\s+list\s+((--)?installed\s+)?kernel\b)/;
 
 export const R17_LABS: Lab[] = [
   {
@@ -172,7 +170,7 @@ export const R17_LABS: Lab[] = [
       {
         text: 'List the installed kernel packages. Both versions must be there.',
         hint: 'rpm -q kernel',
-        check: (sh) => sh.state.kernel.installed.length >= 2 && ran(sh, /^rpm\s+-q.*\bkernel\b/),
+        check: (sh) => sh.state.kernel.installed.length >= 2 && ranAfter(sh, DNF_INSTALL, LIST_KERNELS),
       },
       {
         text: 'Check which kernel GRUB boots by default now.',
