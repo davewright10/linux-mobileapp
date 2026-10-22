@@ -4,7 +4,7 @@
 // dnf and rpm, and what happens to the simulated server when it reboots.
 
 import type { CommandContext, CommandResult } from './commands';
-import { bootStorage } from './commands-storage';
+import { bootStorage, mountBootPartitions } from './commands-storage';
 import { FsError, errorText, joinPath, splitPath } from './fs';
 import {
   BOOT_MODULES,
@@ -192,7 +192,7 @@ const TARGETS: Record<string, string> = {
  * returns the fstab errors that stop the boot, either as a list or as { errors, warnings }, where
  * warnings (a swap line, say) are logged but let the boot go on.
  */
-export const bootSteps: { storage: (sh: Shell) => unknown } = { storage: bootStorage };
+export const bootSteps: { firmware: (sh: Shell) => void; storage: (sh: Shell) => unknown } = { firmware: mountBootPartitions, storage: bootStorage };
 
 /** What the storage step reported, whatever its exact shape: messages as mount(8) or swapon(8) print them. */
 function storageResult(r: unknown): { errors: string[]; warnings: string[] } {
@@ -438,6 +438,7 @@ function bootServer(sh: Shell, before = ''): CommandResult {
   const state = sh.state;
   const k = state.kernel;
   let out = before;
+  bootSteps.firmware(sh);
   if (nodeAt(state.root, GRUB_CFG)?.type !== 'file') {
     return fail(`${out}error: ../../grub-core/kern/fs.c:123:file \`/grub2/grub.cfg' not found.\n\ngrub> \n(Practice server: GRUB found no grub.cfg and stopped at its own prompt. On a real server you would boot by hand from there or from installation media, then run grub2-mkconfig -o /boot/grub2/grub.cfg. This practice server stays up so you can run that now.)`);
   }

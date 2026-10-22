@@ -5,6 +5,7 @@
 import type { CommandContext, CommandResult } from './commands';
 import { FsError, FsNode, canAccess, errorText, joinPath } from './fs';
 import type { Shell } from './shell';
+import { ensureDir } from './kernel-state';
 import type { SystemState } from './state';
 import {
   BlockDevice,
@@ -840,9 +841,18 @@ function partedFmt(bytes: number, unit: string, diskBytes: number): string {
 
 const isUnit = (u: string) => u === 's' || u === '%' || u === 'compact' || !!PARTED_UNITS[u];
 const POS = /^(-?)(\d+(?:\.\d+)?)([a-zA-Z%]*)$/;
+
+/** The unit of a position as parted reads it: the first letter, plus "i" for IEC (1M is 1MB, 1Gi is 1GiB). */
+function posUnit(suffix: string): string | null {
+  const u = suffix.toLowerCase();
+  if (u === 's' || u === '%' || PARTED_UNITS[u]) return u;
+  if (/^[kmgt]i/.test(u)) return `${u[0]}ib`;
+  return ({ s: 's', b: 'b', k: 'kb', m: 'mb', g: 'gb', t: 'tb', '%': '%' } as Record<string, string>)[u[0]] ?? null;
+}
+
 const isPos = (t: string) => {
   const m = POS.exec(t);
-  return !!m && (!m[3] || isUnit(m[3].toLowerCase()));
+  return !!m && (!m[3] || posUnit(m[3]) !== null);
 };
 
 interface PosValue {
@@ -852,7 +862,7 @@ interface PosValue {
 
 function parsePos(text: string, unit: string, disk: Disk, isEnd: boolean): PosValue {
   const m = POS.exec(text)!;
-  let u = (m[3] || unit).toLowerCase();
+  let u = m[3] ? posUnit(m[3])! : unit.toLowerCase();
   if (u === 'compact') u = 'mb';
   const v = parseFloat(m[2]);
   const total = disk.sectors * SECTOR;
@@ -1703,7 +1713,11 @@ const mount: Command = ({ sh, args }) => {
       }
       if (type && !type.split(',').includes(e.type)) continue;
       const where = lookup(sh.state, target);
-      if (target === '/' || (where && s.mounts.some((m) => m.target === '/' + where.parts.join('/')))) {
+      // util-linux skips an entry only when its own source is mounted there, so a wrong UUID still fails
+      const dev = findDevice(s, e.spec);
+      const pseudo = !e.spec.startsWith('/') && !/^(UUID|LABEL|PARTUUID|PARTLABEL)=/.test(e.spec);
+      const here = (m: { target: string; source: string }) => !!where && m.target === '/' + where.parts.join('/') && (pseudo || m.source === dev?.path);
+      if (target === '/' || s.mounts.some(here)) {
         say('already mounted');
         continue;
       }
@@ -2647,12 +2661,25 @@ const pvmove: Command = ({ sh, args }) => {
 // ---------- boot ----------
 
 /**
- * The storage part of a reboot: drop mounts and swap that are not in /etc/fstab, then mount
- * everything listed there. Returns the errors a real boot would hit (empty when it is clean),
- * one line each, worded like mount -a and swapon -a, e.g. "mount: /data: can't find UUID=1234.".
- * Entries with nofail never count as errors.
+ * Firmware and GRUB read /boot and the EFI system partition straight from the disk, whatever is
+ * mounted. Mount them where GRUB expects them before it looks for grub.cfg and the boot entries;
+ * bootStorage then mounts what /etc/fstab says.
  */
-export function bootStorage(sh: Shell): string[] {
+export function mountBootPartitions(sh: Shell): void {
+  const state = sh.state;
+  for (const [dev, target] of [['/dev/nvme0n1p2', '/boot'], ['/dev/nvme0n1p1', '/boot/efi']]) {
+    if (!state.storage.mounts.some((m) => m.target === target)) doMount(state, dev, target, undefined, ['defaults']);
+  }
+}
+
+/**
+ * The storage part of a reboot: drop mounts and swap that are not in /etc/fstab, then mount
+ * everything listed there, creating missing mount points as systemd does. Returns the errors that
+ * stop the boot (empty when it is clean), one line each, worded like mount -a, e.g.
+ * "mount: /data: can't find UUID=1234.", and as warnings the swap lines that fail: systemd only
+ * fails swap.target for those and the boot goes on. Entries with nofail never count.
+ */
+export function bootStorage(sh: Shell): { errors: string[]; warnings: string[] } {
   const state = sh.state;
   const s = state.storage;
   for (const m of [...s.mounts].reverse()) if (m.target !== '/') doUnmount(state, m);
@@ -2663,9 +2690,17 @@ export function bootStorage(sh: Shell): string[] {
   const { entries } = parseFstab(text);
   const depth = (p: string) => p.split('/').filter(Boolean).length;
   const errors: string[] = [];
+  const warnings: string[] = [];
   const mounts = entries.filter((e) => e.type !== 'swap').sort((a, b) => depth(a.file) - depth(b.file));
   for (const e of mounts) {
     if (e.options.includes('noauto') || e.file === '/' || NETWORK_FS.includes(e.type)) continue;
+    if (!lookup(state, e.file)) {
+      try {
+        ensureDir(state.root, e.file);
+      } catch {
+        // a file is in the way: the mount below reports it
+      }
+    }
     const r = doMount(state, e.spec, e.file, e.type, e.options);
     if (r && !e.options.includes('nofail') && !/already mounted/.test(r.error)) errors.push(`mount: ${r.error}`);
   }
@@ -2674,10 +2709,10 @@ export function bootStorage(sh: Shell): string[] {
     const d = findDevice(s, e.spec);
     if (d && isSwapOn(s, d.path)) continue;
     const r = swapOn(state, e.spec, prioOf(e.options));
-    if (r && !e.options.includes('nofail')) errors.push(r);
+    if (r && !e.options.includes('nofail')) warnings.push(r);
   }
   syncDev(state);
-  return errors;
+  return { errors, warnings };
 }
 
 // ---------- tables ----------

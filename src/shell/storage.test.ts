@@ -51,7 +51,7 @@ test('initial disks match the installed system', () => {
   assert.match(out(sh, 'cat /etc/fstab'), /^UUID=4c8a1e2b-7f3d-4a8e-9c1b-2d5e6f7a8b9c \/boot +xfs +defaults +0 0$/m);
   assert.match(out(sh, 'cat /etc/fstab'), /^\/dev\/mapper\/rhel-swap +none +swap +defaults +0 0$/m);
   assert.equal(out(sh, 'findmnt --verify'), 'Success, no errors or warnings detected\n');
-  assert.deepEqual(bootStorage(sh), []);
+  assert.deepEqual(bootStorage(sh), { errors: [], warnings: [] });
 });
 
 test('lsblk options, blkid and /proc files', () => {
@@ -696,7 +696,7 @@ test('reboot: runtime mounts and swap go away, fstab entries come back', () => {
   out(sh, 'echo "LABEL=data /data xfs defaults 0 0" >> /etc/fstab');
   out(sh, 'echo "/dev/nvme0n2p3 /extra ext4 noauto 0 0" >> /etc/fstab');
   out(sh, 'touch /data/under-the-mount');
-  assert.deepEqual(bootStorage(sh), []);
+  assert.deepEqual(bootStorage(sh), { errors: [], warnings: [] });
   assert.equal(mountedAt(sh.state, '/tmpmount'), undefined);
   assert.equal(mountedAt(sh.state, '/extra'), undefined);
   assert.equal(mountedAt(sh.state, '/data')?.source, '/dev/nvme0n2p1');
@@ -717,12 +717,13 @@ test('reboot: runtime mounts and swap go away, fstab entries come back', () => {
   out(sh, 'echo "LABEL=nope none swap defaults 0 0" >> /etc/fstab');
   out(sh, 'echo "UUID=5678 /opt xfs defaults,nofail 0 0" >> /etc/fstab');
   out(sh, 'mkdir /web');
-  assert.deepEqual(bootStorage(sh), [
-    "mount: /web: can't find UUID=1234.",
-    'mount: /nodir: mount point does not exist.',
-    'mount: /backup: special device /dev/sdz1 does not exist.',
-    'swapon: cannot find the device for LABEL=nope',
-  ]);
+  assert.deepEqual(bootStorage(sh), {
+    errors: ["mount: /web: can't find UUID=1234.", 'mount: /backup: special device /dev/sdz1 does not exist.'],
+    // a bad swap line only fails swap.target
+    warnings: ['swapon: cannot find the device for LABEL=nope'],
+  });
+  // systemd creates a missing mount point
+  assert.equal(mountedAt(sh.state, '/nodir')?.source, '/dev/nvme0n2p1');
   // two entries for /data: the first wins and the second stacks on top, like a real boot
   assert.equal(mountedAt(sh.state, '/data')?.source, '/dev/nvme0n2p3');
 });
@@ -732,7 +733,7 @@ test('boot reports a wrong file system type', () => {
   out(sh, 'mkfs.xfs /dev/nvme0n3');
   out(sh, 'mkdir /data');
   out(sh, 'echo "/dev/nvme0n3 /data ext4 defaults 0 0" >> /etc/fstab');
-  assert.deepEqual(bootStorage(sh), ['mount: /data: wrong fs type, bad option, bad superblock on /dev/nvme0n3, missing codepage or helper program, or other error.']);
+  assert.deepEqual(bootStorage(sh).errors, ['mount: /data: wrong fs type, bad option, bad superblock on /dev/nvme0n3, missing codepage or helper program, or other error.']);
   assert.equal(mountedAt(sh.state, '/data'), undefined);
 });
 

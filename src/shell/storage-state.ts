@@ -629,7 +629,8 @@ export function fstabCheck(state: SystemState): { entry: FstabEntry; dev: BlockD
       return { entry, dev: findDevice(state.storage, entry.spec), error: null };
     }
     const p = planMount(state, entry.spec, entry.file, entry.type, entry.options);
-    const error = p.error && !/already mounted/.test(p.error) ? `mount: ${p.error}` : null;
+    // a boot creates a missing mount point, so only mount -a would trip over it
+    const error = p.error && !/already mounted|mount point does not exist/.test(p.error) ? `mount: ${p.error}` : null;
     return { entry, dev: p.dev ?? null, error: entry.options.includes('noauto') ? null : error };
   });
 }
