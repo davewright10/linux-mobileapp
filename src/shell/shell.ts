@@ -106,7 +106,7 @@ export class InputStream {
   }
 }
 
-type Chunk = [1 | 2, string];
+export type Chunk = [1 | 2, string];
 
 /** Collects what a command writes to stdout or stderr. A shared log keeps both in order. */
 class Sink {
@@ -1500,6 +1500,14 @@ export class Shell {
     }
     io.err.write(fix(res.stderr));
     io.out.write(res.stdout);
+  }
+
+  /** A command result whose stdout and stderr reach the screen in the order written, as find's do. */
+  interleaved(log: Chunk[], code: number): CommandResult {
+    const text = (fd: 1 | 2) => log.filter((c) => c[0] === fd).map((c) => c[1]).join('');
+    const res: CommandResult = { stdout: text(1), stderr: text(2), code };
+    this.chunks.set(res, log.filter((c) => c[1]));
+    return res;
   }
 
   /** Run one command with already-expanded argv. */

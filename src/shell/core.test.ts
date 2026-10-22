@@ -437,3 +437,47 @@ test('cp: a new file gets the source mode minus the umask; -p and -a keep it; an
   out(sh, 'chmod 644 src && sudo cp src /tmp/byroot');
   assert.match(out(sh, 'ls -l /tmp/byroot'), /^-rw-r--r--\. 1 root root /);
 });
+
+test('echo options and escapes work like bash', () => {
+  const sh = new Shell();
+  const out = (l: string) => sh.run(l).output;
+  assert.equal(out(String.raw`echo -e "a\tb\nc"`), 'a\tb\nc\n');
+  assert.equal(out(String.raw`echo -ne "x\n"; echo -en "y"; echo`), 'x\ny\n');
+  assert.equal(out(String.raw`echo -e "stop\c here"`), 'stop');
+  assert.equal(out(String.raw`echo -e "\x41\0102\\"`), 'AB\\\n');
+  assert.equal(out(String.raw`echo -e 'q\"\q'`), 'q\\"\\q\n');
+  assert.equal(out(String.raw`echo -E "a\tb"; echo "a\tb"`), 'a\\tb\na\\tb\n');
+  assert.equal(out('echo -nx hi; echo -- -n'), '-nx hi\n-- -n\n');
+});
+
+test('date prints the server clock and +FORMAT', () => {
+  const sh = new Shell();
+  const out = (l: string) => sh.run(l).output;
+  assert.match(out('date'), /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d [AP]M E[DS]T \d{4}\n$/);
+  assert.match(out('date +%F'), /^\d{4}-\d\d-\d\d\n$/);
+  assert.equal(out('date -u -d @0'), 'Thu Jan  1 12:00:00 AM UTC 1970\n');
+  assert.equal(out('date -u -d @86399 "+%Y-%m-%d %H:%M:%S %j %a %A %b %B %e %-d %s %%"'), '1970-01-01 23:59:59 001 Thu Thursday Jan January  1 1 86399 %\n');
+  assert.equal(out('date -d "2026-07-04 14:05" "+%T %R %I %p %Z %z %:z"'), '14:05:00 14:05 02 PM EDT -0400 -04:00\n');
+  assert.equal(out('date -d 2026-01-05 +%D_%u_%w'), '01/05/26_1_1\n');
+  assert.equal(out('date -d 2026-01-05 -I; date -u -d @0 -Iseconds'), '2026-01-05\n1970-01-01T00:00:00+00:00\n');
+  assert.equal(out('date -u -d @0 -R'), 'Thu, 01 Jan 1970 00:00:00 +0000\n');
+  assert.equal(out(`[ "$(date -d yesterday +%s)" -lt "$(date +%s)" ] && echo earlier`), 'earlier\n');
+  assert.equal(out('date -d bogus'), 'date: invalid date ‘bogus’\n');
+  out('sudo timedatectl set-timezone Europe/Amsterdam');
+  assert.equal(out('date -d "2026-07-01 12:00" +%H:%Z'), '12:CEST\n');
+  assert.equal(out('date -u -d "2026-07-01 12:00" +%H:%Z'), '12:UTC\n');
+});
+
+test('uptime starts again at a reboot; ls -a shows the real parent; sestatus after SELinux is disabled', () => {
+  const sh = new Shell();
+  const out = (l: string) => sh.run(l).output;
+  assert.match(out('uptime'), /^ \d\d:\d\d:\d\d up 3 days,  4:11,  1 user,  load average: [\d., ]+\n$/);
+  assert.equal(out('uptime -p'), 'up 3 days, 4 hours, 11 minutes\n');
+  assert.match(out('uptime -s'), /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\n$/);
+  assert.match(out('ls -la /home/student'), /\n\S+ \d+ student student .* \.\n\S+ \d+ root root .* \.\.\n/);
+  out('sudo reboot');
+  assert.match(out('uptime'), / up 0 min, /);
+  assert.equal(out('uptime -p'), 'up 0 minutes\n');
+  sh.state.selinux = 'Disabled';
+  assert.equal(out('sestatus'), 'SELinux status:                 disabled\n');
+});

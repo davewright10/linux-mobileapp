@@ -15,6 +15,7 @@ import {
   splitPath,
 } from './fs';
 import { ADMIN_COMMANDS } from './commands-admin';
+import { FIND_COMMANDS } from './commands-find';
 import { KERNEL_COMMANDS, kernelDnf, kernelRpm, rebootSystem } from './commands-kernel';
 import { SCRIPT_COMMANDS } from './commands-script';
 import { STORAGE_COMMANDS } from './commands-storage';
@@ -22,6 +23,7 @@ import { RegexSyntaxError, TEXT_COMMANDS, posixRegex } from './commands-text';
 import { journalctl, journaldStart, mountUnit } from './journal';
 import { machineId, nodeAt } from './kernel-state';
 import { MAN_PAGES } from './manpages';
+import { cEscape } from './parser';
 import type { Shell } from './shell';
 import { AVAILABLE_PACKAGES, Group, User, pkgKey, pkgName, runningHostname } from './state';
 import { fstabCheck } from './storage-state';
@@ -184,7 +186,15 @@ const ls: Command = ({ sh, args, tty }) => {
     if (sortTime) names.sort((a, b) => node.children![b].mtime - node.children![a].mtime);
     if (reverse) names.reverse();
     const entries: [string, FsNode][] = names.map((n) => [n, node.children![n]]);
-    if (all) entries.unshift(['.', node], ['..', node]);
+    if (all) {
+      let parent = node;
+      try {
+        parent = sh.resolve(path === '/' ? '/' : `${path.replace(/\/+$/, '')}/..`).node;
+      } catch {
+        // no access to the parent: show the directory itself, as before
+      }
+      entries.unshift(['.', node], ['..', parent]);
+    }
     if (header) out += `${path}:\n`;
     if (long) {
       const total = entries.reduce((s, [, n]) => s + Math.ceil(nodeSize(n) / 1024) * 4, 0);
@@ -309,15 +319,30 @@ const cat: Command = ({ sh, args, stdin }) => {
 const echo: Command = ({ args }) => {
   let newline = true;
   let escapes = false;
-  let rest = args;
-  while (rest[0] === '-n' || rest[0] === '-e') {
-    if (rest[0] === '-n') newline = false;
-    else escapes = true;
-    rest = rest.slice(1);
+  let k = 0;
+  // bash's echo: every leading word made of n, e and E letters is options (-n, -e, -ne, -eE)
+  for (; k < args.length && /^-[neE]+$/.test(args[k]); k++) {
+    for (const c of args[k].slice(1)) {
+      if (c === 'n') newline = false;
+      else escapes = c === 'e';
+    }
   }
-  let s = rest.join(' ');
-  if (escapes) s = s.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-  return ok(s + (newline ? '\n' : ''));
+  const s = args.slice(k).join(' ');
+  if (!escapes) return ok(s + (newline ? '\n' : ''));
+  let r = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i + 1];
+    if (s[i] !== '\\' || c === undefined) r += s[i];
+    else if (c === 'c') return ok(r); // \c: nothing more, not even the newline
+    else if (c === "'" || c === '"' || c === '?') r += '\\';
+    else {
+      // \n \t \\ \a \e, \0NNN octal, \xHH, \uHHHH; anything else stays as typed
+      const [text, used] = cEscape(s, i + 1, true);
+      r += text;
+      i += used;
+    }
+  }
+  return ok(r + (newline ? '\n' : ''));
 };
 
 /**
@@ -495,60 +520,6 @@ const file: Command = ({ sh, args }) => {
     }
   }
   return ok(out);
-};
-
-const find: Command = ({ sh, args }) => {
-  let start = '.';
-  let i = 0;
-  if (args[0] && !args[0].startsWith('-')) {
-    start = args[0];
-    i = 1;
-  }
-  let nameRe: RegExp | null = null;
-  let type: string | null = null;
-  let user: string | null = null;
-  let perm: string | null = null;
-  for (; i < args.length; i++) {
-    const a = args[i];
-    const v = args[++i] ?? '';
-    if (a === '-name' || a === '-iname') {
-      const src = '^' + v.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$';
-      nameRe = new RegExp(src, a === '-iname' ? 'i' : '');
-    } else if (a === '-type') type = v;
-    else if (a === '-user') user = v;
-    else if (a === '-perm') perm = v;
-    else return fail(`find: unknown predicate '${a}'`);
-  }
-  let out = '';
-  let err = '';
-  const visit = (path: string, node: FsNode, name: string) => {
-    const t = node.type === 'dir' ? 'd' : node.type === 'link' ? 'l' : 'f';
-    let match = true;
-    if (nameRe && !nameRe.test(name)) match = false;
-    if (type && type !== t) match = false;
-    if (user && userName(sh, node.uid) !== user) match = false;
-    if (perm) {
-      const want = parseInt(perm.replace(/^[-/]/, ''), 8);
-      if (perm.startsWith('-') || perm.startsWith('/')) {
-        if (perm.startsWith('-') ? (node.mode & want) !== want : (node.mode & want) === 0) match = false;
-      } else if ((node.mode & 0o7777) !== want) match = false;
-    }
-    if (match) out += path + '\n';
-    if (node.type === 'dir') {
-      if (!canAccess(node, 'r', sh.uid, sh.gids) || !canAccess(node, 'x', sh.uid, sh.gids)) {
-        err += `find: '${path}': Permission denied\n`;
-        return;
-      }
-      for (const [n, c] of Object.entries(node.children!).sort()) visit(`${path === '/' ? '' : path}/${n}`, c, n);
-    }
-  };
-  try {
-    const r = sh.resolve(start);
-    visit(start, r.node, r.name);
-  } catch (e) {
-    return fail(`find: '${start}': ${e instanceof FsError ? errorText[e.reason] : e}`);
-  }
-  return { stdout: out, stderr: err, code: err ? 1 : 0 };
 };
 
 // ---------- text tools ----------
@@ -1570,9 +1541,157 @@ const uname: Command = ({ args }) => {
   return ok('Linux\n');
 };
 
-const date: Command = () => ok(new Date().toString() + '\n');
+// ---------- date ----------
 
-const uptime: Command = () => ok(' 15:42:07 up 3 days,  4:11,  1 user,  load average: 0.08, 0.03, 0.01\n');
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+/** Wall-clock fields of a moment in a time zone, with the zone's abbreviation and UTC offset in minutes. */
+function zonedTime(ms: number, tz: string) {
+  let offset = 0;
+  let abbr = 'UTC';
+  if (tz !== 'UTC') {
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric', timeZoneName: 'short' }).formatToParts(new Date(ms));
+      const get = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? 0);
+      offset = Math.round((Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second')) - Math.floor(ms / 1000) * 1000) / 60_000);
+      // en-US knows EDT and PDT, en-GB knows CEST and BST; other zones show their offset, like +0530
+      const gb = new Intl.DateTimeFormat('en-GB', { timeZone: tz, timeZoneName: 'short' }).formatToParts(new Date(ms));
+      const name = [parts, gb].map((ps) => ps.find((p) => p.type === 'timeZoneName')?.value ?? '').find((n) => /^[A-Z]{3,5}$/.test(n));
+      const abs = Math.abs(offset);
+      abbr = name ?? `${offset < 0 ? '-' : '+'}${String(Math.floor(abs / 60)).padStart(2, '0')}${abs % 60 ? String(abs % 60).padStart(2, '0') : ''}`;
+    } catch {
+      // no time zone data: show UTC
+    }
+  }
+  const d = new Date(ms + offset * 60_000);
+  return { y: d.getUTCFullYear(), mo: d.getUTCMonth(), d: d.getUTCDate(), h: d.getUTCHours(), mi: d.getUTCMinutes(), s: d.getUTCSeconds(), wd: d.getUTCDay(), ms, offset, abbr };
+}
+
+/** strftime as GNU date formats it in the en_US.UTF-8 locale, with the - _ 0 flags. */
+function strftime(fmt: string, t: ReturnType<typeof zonedTime>): string {
+  const yday = Math.floor((Date.UTC(t.y, t.mo, t.d) - Date.UTC(t.y, 0, 1)) / 86_400_000) + 1;
+  const h12 = t.h % 12 || 12;
+  const off = (colon: boolean) => {
+    const a = Math.abs(t.offset);
+    return `${t.offset < 0 ? '-' : '+'}${String(Math.floor(a / 60)).padStart(2, '0')}${colon ? ':' : ''}${String(a % 60).padStart(2, '0')}`;
+  };
+  const pad = (n: number, w: number, flag: string, space = false) => (flag === '-' ? String(n) : String(n).padStart(w, flag === '_' || (space && flag !== '0') ? ' ' : '0'));
+  const one = (c: string, flag: string): string | null => {
+    switch (c) {
+      case 'Y': return String(t.y);
+      case 'C': return pad(Math.floor(t.y / 100), 2, flag);
+      case 'y': return pad(t.y % 100, 2, flag);
+      case 'm': return pad(t.mo + 1, 2, flag);
+      case 'd': return pad(t.d, 2, flag);
+      case 'e': return pad(t.d, 2, flag, true);
+      case 'H': return pad(t.h, 2, flag);
+      case 'k': return pad(t.h, 2, flag, true);
+      case 'I': return pad(h12, 2, flag);
+      case 'l': return pad(h12, 2, flag, true);
+      case 'M': return pad(t.mi, 2, flag);
+      case 'S': return pad(t.s, 2, flag);
+      case 'N': return String((t.ms % 1000) * 1_000_000).padStart(9, '0');
+      case 'p': return t.h < 12 ? 'AM' : 'PM';
+      case 'P': return t.h < 12 ? 'am' : 'pm';
+      case 'a': return WEEKDAYS[t.wd].slice(0, 3);
+      case 'A': return WEEKDAYS[t.wd];
+      case 'b': case 'h': return MONTH_NAMES[t.mo].slice(0, 3);
+      case 'B': return MONTH_NAMES[t.mo];
+      case 'j': return pad(yday, 3, flag);
+      case 'u': return String(t.wd || 7);
+      case 'w': return String(t.wd);
+      case 's': return String(Math.floor(t.ms / 1000));
+      case 'Z': return t.abbr;
+      case 'z': return off(false);
+      case 'F': return `${t.y}-${pad(t.mo + 1, 2, '')}-${pad(t.d, 2, '')}`;
+      case 'T': return `${pad(t.h, 2, '')}:${pad(t.mi, 2, '')}:${pad(t.s, 2, '')}`;
+      case 'R': return `${pad(t.h, 2, '')}:${pad(t.mi, 2, '')}`;
+      case 'D': case 'x': return `${pad(t.mo + 1, 2, '')}/${pad(t.d, 2, '')}/${pad(t.y % 100, 2, '')}`;
+      case 'r': return `${pad(h12, 2, '')}:${pad(t.mi, 2, '')}:${pad(t.s, 2, '')} ${t.h < 12 ? 'AM' : 'PM'}`;
+      case 'X': return one('r', '');
+      case 'c': return `${one('a', '')} ${one('d', '')} ${one('b', '')} ${t.y} ${one('r', '')} ${t.abbr}`;
+      case 'n': return '\n';
+      case 't': return '\t';
+      case '%': return '%';
+      default: return null;
+    }
+  };
+  return fmt.replace(/%([-_0^]?)(:?)([A-Za-z%])/g, (all, flag: string, colon: string, c: string) => {
+    if (colon) return c === 'z' ? off(true) : all;
+    const v = one(c, flag === '^' ? '' : flag);
+    if (v === null) return all;
+    return flag === '^' ? v.toUpperCase() : v;
+  });
+}
+
+/** The few -d forms scripts use: now, today, yesterday, tomorrow, N days ago, +N days, @EPOCH, YYYY-MM-DD [HH:MM[:SS]]. */
+function parseDateArg(text: string, now: number, tz: string): number | null {
+  const s = text.trim().toLowerCase();
+  if (s === '' || s === 'now' || s === 'today') return now;
+  if (s === 'yesterday') return now - 86_400_000;
+  if (s === 'tomorrow') return now + 86_400_000;
+  let m = /^@(-?\d+)$/.exec(s);
+  if (m) return Number(m[1]) * 1000;
+  const units: Record<string, number> = { sec: 1000, second: 1000, min: 60_000, minute: 60_000, hour: 3_600_000, day: 86_400_000, week: 604_800_000 };
+  m = /^([+-]?\d+)\s*(sec|second|min|minute|hour|day|week)s?(\s+ago)?$/.exec(s);
+  if (m) return now + Number(m[1]) * units[m[2]] * (m[3] ? -1 : 1);
+  m = /^(next|last)\s+(day|week)$/.exec(s);
+  if (m) return now + units[m[2]] * (m[1] === 'next' ? 1 : -1);
+  m = /^(\d{4})-(\d\d)-(\d\d)(?:[ t](\d\d?):(\d\d)(?::(\d\d))?)?$/.exec(s);
+  if (!m) return null;
+  // a date and time on the server's clock (its time zone), not in UTC
+  const wall = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4] ?? 0), Number(m[5] ?? 0), Number(m[6] ?? 0));
+  return wall - zonedTime(wall, tz).offset * 60_000;
+}
+
+const date: Command = ({ sh, args }) => {
+  const utc = args.some((a) => a === '-u' || a === '--utc' || a === '--universal');
+  const tz = utc ? 'UTC' : sh.state.timezone;
+  let when = Date.now();
+  let fmt: string | null = null;
+  let iso: string | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-u' || a === '--utc' || a === '--universal') continue;
+    if (a === '-d' || a.startsWith('--date=') || (a.startsWith('-d') && a.length > 2)) {
+      const v = a === '-d' ? args[++i] : a.startsWith('--date=') ? a.slice(7) : a.slice(2);
+      if (v === undefined) return fail("date: option requires an argument -- 'd'\nTry 'date --help' for more information.");
+      const t = parseDateArg(v, Date.now(), tz);
+      if (t === null) return fail(`date: invalid date ‘${v}’`);
+      when = t;
+    } else if (a === '-I' || a.startsWith('--iso-8601') || (a.startsWith('-I') && a.length > 2)) iso = a.replace(/^(-I|--iso-8601=?)/, '') || 'date';
+    else if (a === '-R' || a === '--rfc-email') fmt = '%a, %d %b %Y %H:%M:%S %z';
+    else if (a === '-s' || a.startsWith('--set')) return sh.uid === 0 ? fail('date: setting the time is not possible in the practice terminal; use timedatectl') : fail('date: cannot set date: Operation not permitted');
+    else if (a.startsWith('+')) {
+      if (fmt !== null) return fail(`date: extra operand ‘${a}’\nTry 'date --help' for more information.`);
+      fmt = a.slice(1);
+    } else return fail(`date: invalid date ‘${a}’`);
+  }
+  const t = zonedTime(when, tz);
+  if (iso !== null) {
+    const parts: Record<string, string> = { date: '%F', hours: '%FT%H%:z', minutes: '%FT%H:%M%:z', seconds: '%FT%T%:z', ns: '%FT%T,%N%:z' };
+    if (!parts[iso]) return fail(`date: invalid argument ‘${iso}’ for ‘--iso-8601’`);
+    fmt = parts[iso];
+  }
+  return ok(strftime(fmt ?? '%a %b %e %r %Z %Y', t) + '\n');
+};
+
+/** uptime from procps-ng 4: the time since the last (simulated) boot. */
+const uptime: Command = ({ sh, args }) => {
+  const now = Date.now();
+  const boot = sh.state.kernel.bootTime;
+  const mins = Math.max(0, Math.floor((now - boot) / 60_000));
+  const [days, hours, min] = [Math.floor(mins / 1440), Math.floor((mins % 1440) / 60), mins % 60];
+  const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  if (args.includes('-p') || args.includes('--pretty')) {
+    const parts = [days && plural(days, 'day'), hours && plural(hours, 'hour'), (min || mins === 0) && plural(min, 'minute')].filter(Boolean);
+    return ok(`up ${parts.join(', ')}\n`);
+  }
+  if (args.includes('-s') || args.includes('--since')) return ok(strftime('%F %T', zonedTime(boot, sh.state.timezone)) + '\n');
+  const up = (days ? `${plural(days, 'day')}, ` : '') + (hours ? `${String(hours).padStart(2)}:${String(min).padStart(2, '0')}` : `${min} min`);
+  return ok(` ${strftime('%T', zonedTime(now, sh.state.timezone))} up ${up},  1 user,  load average: 0.08, 0.03, 0.01\n`);
+};
 
 
 const ping: Command = ({ args }) => {
@@ -1996,7 +2115,7 @@ const setenforce: Command = ({ sh, args }) => {
 };
 
 const sestatus: Command = ({ sh }) =>
-  ok(
+  sh.state.selinux === 'Disabled' ? ok('SELinux status:                 disabled\n') : ok(
     `SELinux status:                 enabled\nSELinuxfs mount:                /sys/fs/selinux\nLoaded policy name:             targeted\nCurrent mode:                   ${sh.state.selinux.toLowerCase()}\nMode from config file:          ${sh.state.selinuxConfigMode}\nPolicy MLS status:              enabled\n`,
   );
 
@@ -2049,32 +2168,6 @@ const history: Command = ({ sh }) => ok(sh.history.map((h, i) => `${String(i + 1
 
 const clear: Command = () => ({ stdout: '', stderr: '', code: 0, clear: true });
 
-const which: Command = ({ args }) => {
-  let out = '';
-  let err = '';
-  for (const a of args) {
-    if (COMMANDS[a]) out += `/usr/bin/${a}\n`;
-    else err += `/usr/bin/which: no ${a} in (/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin)\n`;
-  }
-  return { stdout: out, stderr: err, code: err ? 1 : 0 };
-};
-
-const typeCmd: Command = ({ args }) => {
-  const builtins = ['cd', 'echo', 'exit', 'history', 'umask', 'export', 'type', 'pwd', 'alias'];
-  return ok(args.map((a) => (builtins.includes(a) ? `${a} is a shell builtin` : COMMANDS[a] ? `${a} is /usr/bin/${a}` : `-bash: type: ${a}: not found`)).join('\n') + '\n');
-};
-
-const exportCmd: Command = ({ sh, args }) => {
-  for (const a of args) {
-    const [k, ...v] = a.split('=');
-    if (v.length) sh.env[k] = v.join('=');
-  }
-  return ok();
-};
-
-const env: Command = ({ sh }) =>
-  ok(['HOME', 'USER', 'PWD', 'SHELL', 'HOSTNAME', 'PATH'].map((k) => `${k}=${sh.getVar(k)}`).concat(Object.entries(sh.env).filter(([k]) => k !== 'OLDPWD').map(([k, v]) => `${k}=${v}`)).join('\n') + '\n');
-
 const man: Command = ({ args }) => {
   const topic = args.filter((a) => !/^\d$/.test(a) && a !== '-k')[0];
   if (args[0] === '-k') {
@@ -2097,74 +2190,6 @@ const help: Command = () => {
 
 const trueCmd: Command = () => ok();
 const falseCmd: Command = () => ({ stdout: '', stderr: '', code: 1 });
-
-const test: Command = ({ sh, args, name }) => {
-  const a = name === '[' ? args.slice(0, -1) : args;
-  if (name === '[' && args[args.length - 1] !== ']') return fail("[: missing `]'", 2);
-  const res = (v: boolean): CommandResult => ({ stdout: '', stderr: '', code: v ? 0 : 1 });
-  let neg = false;
-  if (a[0] === '!') {
-    neg = true;
-    a.shift();
-  }
-  const r = (v: boolean) => res(neg ? !v : v);
-  if (a.length === 2) {
-    const [op, p] = a;
-    const node = (() => {
-      try {
-        return sh.resolve(p).node;
-      } catch {
-        return null;
-      }
-    })();
-    switch (op) {
-      case '-e':
-        return r(!!node);
-      case '-f':
-        return r(node?.type === 'file');
-      case '-d':
-        return r(node?.type === 'dir');
-      case '-r':
-        return r(!!node && canAccess(node, 'r', sh.uid, sh.gids));
-      case '-w':
-        return r(!!node && canAccess(node, 'w', sh.uid, sh.gids));
-      case '-x':
-        return r(!!node && canAccess(node, 'x', sh.uid, sh.gids));
-      case '-s':
-        return r(!!node && nodeSize(node) > 0);
-      case '-z':
-        return r(p === '');
-      case '-n':
-        return r(p !== '');
-    }
-  }
-  if (a.length === 3) {
-    const [x, op, y] = a;
-    const nx = parseInt(x, 10);
-    const ny = parseInt(y, 10);
-    switch (op) {
-      case '=':
-      case '==':
-        return r(x === y);
-      case '!=':
-        return r(x !== y);
-      case '-eq':
-        return r(nx === ny);
-      case '-ne':
-        return r(nx !== ny);
-      case '-lt':
-        return r(nx < ny);
-      case '-le':
-        return r(nx <= ny);
-      case '-gt':
-        return r(nx > ny);
-      case '-ge':
-        return r(nx >= ny);
-    }
-  }
-  if (a.length === 1) return r(a[0] !== '');
-  return res(neg);
-};
 
 const crontab: Command = ({ sh, args, stdin }) => {
   const { flags, values } = getopts(args, ['u']);
@@ -2193,8 +2218,8 @@ const crontab: Command = ({ sh, args, stdin }) => {
 };
 
 export const COMMANDS: Record<string, Command> = {
-  pwd, cd, ls, mkdir, rmdir, touch, cat, echo, cp, mv, rm, ln, readlink, stat, file, find,
-  head: headTail(true), tail: headTail(false), wc, grep, egrep: grep, sort, uniq, cut, tee, ...TEXT_COMMANDS,
+  pwd, cd, ls, mkdir, rmdir, touch, cat, echo, cp, mv, rm, ln, readlink, stat, file,
+  head: headTail(true), tail: headTail(false), wc, grep, egrep: grep, sort, uniq, cut, tee, ...TEXT_COMMANDS, ...FIND_COMMANDS,
   less: pager, more: pager, vim: editor, vi: editor, nano: editor,
   tar, gzip: compressCmd('.gz', false), gunzip: compressCmd('.gz', true), bzip2: compressCmd('.bz2', false), bunzip2: compressCmd('.bz2', true),
   whoami, id, groups: groupsCmd, useradd, usermod, userdel, groupadd, groupdel, groupmod, gpasswd, passwd, chage,
@@ -2202,8 +2227,8 @@ export const COMMANDS: Record<string, Command> = {
   hostname, hostnamectl, uname, date, uptime, ping, df, free, lsblk,
   systemctl, dnf, yum: dnf, rpm, getenforce, setenforce, sestatus, 'firewall-cmd': firewallCmd,
   journalctl, crontab,
-  history, clear, which, type: typeCmd, export: exportCmd, env, man, help,
-  true: trueCmd, false: falseCmd, test, '[': test,
+  history, clear, man, help,
+  true: trueCmd, false: falseCmd,
   ...ADMIN_COMMANDS,
   ...STORAGE_COMMANDS,
   ...KERNEL_COMMANDS,
