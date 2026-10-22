@@ -177,11 +177,11 @@ test('journalctl finds the errors of a boot that stopped in emergency mode', () 
   out(sh, 'sudo mkdir /data');
   assert.match(out(sh, 'sudo reboot'), /emergency mode/);
   const errs = out(sh, 'journalctl -p err -b');
-  assert.match(errs, /systemd\[1\]: mount: \/data: special device \/dev\/vgdata\/lvdata does not exist\./);
+  assert.match(errs, /systemd\[1\]: Timed out waiting for device dev-vgdata-lvdata\.device - \/dev\/vgdata\/lvdata\./);
   assert.doesNotMatch(errs, /Linux version|Reached target/);
   const xb = out(sh, 'journalctl -xb');
   assert.match(xb, /kernel: Linux version /);
-  assert.match(xb, /mount: \/data: special device[^\n]*\n░░ Subject: A start job for unit data\.mount has failed\n░░ Defined-By: systemd\n/);
+  assert.match(xb, /Dependency failed for data\.mount - \/data\.\n░░ Subject: A start job for unit data\.mount has failed\n░░ Defined-By: systemd\n/);
   assert.match(xb, /Dependency failed for local-fs\.target - Local File Systems\.\n░░ Subject: A start job for unit local-fs\.target has failed\n/);
   assert.match(xb, /The job identifier is \d+ and the job result is dependency\./);
   assert.match(xb, /Reached target emergency\.target - Emergency Mode\./);

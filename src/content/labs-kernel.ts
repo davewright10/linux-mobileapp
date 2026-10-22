@@ -2,7 +2,6 @@ import {
   UPDATE_KERNEL,
   type BootEntry,
   bootEntries,
-  bootLog,
   defaultBootEntry,
   entryHasArg,
   insertModule,
@@ -10,11 +9,9 @@ import {
   modprobeConfig,
   moduleDeps,
   moduleParam,
-  putFile,
   readSettings,
   splitArgs,
   textAt,
-  writeEntry,
 } from '@/shell/kernel-state';
 import type { Shell } from '@/shell/shell';
 import { fsOn, fstabCheck, fstabFor, mountedAt, syncDev } from '@/shell/storage-state';
@@ -51,19 +48,6 @@ const runningArgs = (sh: Shell) => splitArgs(sh.state.kernel.cmdline);
 
 // ---------- R16: boot procedure and GRUB ----------
 
-/** Lab setup: give every boot entry, GRUB_CMDLINE_LINUX and the running kernel extra arguments, as if installed with them. */
-function addBootArgs(sh: Shell, args: string): void {
-  const s = sh.state;
-  for (const e of bootEntries(s)) {
-    e.options = `${e.options} ${args}`;
-    writeEntry(s, e);
-  }
-  const grub = textAt(s.root, '/etc/default/grub') ?? '';
-  putFile(s.root, '/etc/default/grub', grub.replace(/^(GRUB_CMDLINE_LINUX=".*)"$/m, (_, start: string) => `${start} ${args}"`));
-  s.kernel.cmdline = `${s.kernel.cmdline} ${args}`;
-  s.kernel.dmesg = bootLog(s.kernel.running, s.kernel.cmdline);
-}
-
 const noSplash = (e: BootEntry) => !entryHasArg(e, 'rhgb') && !entryHasArg(e, 'quiet');
 const newArgsRunning = (sh: Shell) => {
   const a = runningArgs(sh);
@@ -76,7 +60,6 @@ export const R16_BOOT_LABS: Lab[] = [
     title: 'Kernel arguments and the GRUB timeout',
     intro:
       'server1 shows a splash screen while it boots (the rhgb kernel argument) and hides most boot messages (quiet). Make the messages visible, turn on auditing from the very start of the boot (audit=1), and give the GRUB menu 10 seconds. Kernel arguments live in the boot entries in /boot/loader/entries. grubby changes those entries directly, and with --update-kernel=ALL it also updates GRUB_CMDLINE_LINUX in /etc/default/grub. If you edit /etc/default/grub yourself, run grub2-mkconfig with --update-bls-cmdline: on RHEL 10 the boot entries keep their old arguments without it. The kernel gets new arguments at the next boot; /proc/cmdline shows the ones it is running with.',
-    setup: (sh) => addBootArgs(sh, 'rhgb quiet'),
     tasks: [
       {
         text: 'Show the arguments the running kernel was booted with.',

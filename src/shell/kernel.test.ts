@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { bootSteps, parseKernelPkg, updatedOptions } from './commands-kernel';
+import { mountedAt } from './storage-state';
 import {
   DEFAULT_KERNEL_ARGS,
   MACHINE_ID,
@@ -11,6 +12,7 @@ import {
   entryHasArg,
   installKernel,
   isLoaded,
+  loadFsModule,
   moduleDeps,
   moduleParam,
   nodeAt,
@@ -29,9 +31,9 @@ const ENTRY = `/boot/loader/entries/${MACHINE_ID}-${OLD}.conf`;
 const NEW_ENTRY = `/boot/loader/entries/${MACHINE_ID}-${NEW}.conf`;
 
 /** Run a reboot with the storage step replaced (for example to make it fail). */
-function withStorage<T>(errors: string[], fn: () => T): T {
+function withStorage<T>(res: string[] | { errors: string[]; warnings: string[] }, fn: () => T): T {
   const saved = bootSteps.storage;
-  bootSteps.storage = () => errors;
+  bootSteps.storage = () => res;
   try {
     return fn();
   } finally {
@@ -53,7 +55,7 @@ test('fresh system: running kernel, boot entry and kernel arguments', () => {
   assert.equal(out(sh, 'cat /proc/cmdline'), cmdline);
 
   const grub = out(sh, 'cat /etc/default/grub');
-  for (const line of ['GRUB_TIMEOUT=5', 'GRUB_DISTRIBUTOR=', 'GRUB_DEFAULT=saved', 'GRUB_DISABLE_SUBMENU=true', 'GRUB_TERMINAL_OUTPUT="console"', `GRUB_CMDLINE_LINUX="crashkernel=`, 'resume=/dev/mapper/rhel-swap rd.lvm.lv=rhel/root rd.lvm.lv=rhel/swap"', 'GRUB_DISABLE_RECOVERY="true"', 'GRUB_ENABLE_BLSCFG=true']) {
+  for (const line of ['GRUB_TIMEOUT=5', 'GRUB_DISTRIBUTOR=', 'GRUB_DEFAULT=saved', 'GRUB_DISABLE_SUBMENU=true', 'GRUB_TERMINAL_OUTPUT="console"', `GRUB_CMDLINE_LINUX="crashkernel=`, 'resume=/dev/mapper/rhel-swap rd.lvm.lv=rhel/root rd.lvm.lv=rhel/swap rhgb quiet"', 'GRUB_DISABLE_RECOVERY="true"', 'GRUB_ENABLE_BLSCFG=true']) {
     assert.ok(grub.includes(line), line);
   }
 
@@ -106,7 +108,7 @@ test('grubby shows the boot entries', () => {
   assert.equal(out(sh, 'sudo grubby --default-index'), '0\n');
   assert.equal(out(sh, 'sudo grubby --default-title'), `Red Hat Enterprise Linux (${OLD}) 10.0 (Coughlan)\n`);
   const info = out(sh, 'sudo grubby --info=ALL');
-  assert.match(info, new RegExp(`^index=0\nkernel="/boot/vmlinuz-${OLD}"\nargs="ro crashkernel=[^"]+ rd\\.lvm\\.lv=rhel/swap"\nroot="/dev/mapper/rhel-root"\ninitrd="/boot/initramfs-${OLD}\\.img"\ntitle="[^"]+"\nid="${MACHINE_ID}-${OLD}"\n`));
+  assert.match(info, new RegExp(`^index=0\nkernel="/boot/vmlinuz-${OLD}"\nargs="ro crashkernel=[^"]+ rd\\.lvm\\.lv=rhel/swap rhgb quiet"\nroot="/dev/mapper/rhel-root"\ninitrd="/boot/initramfs-${OLD}\\.img"\ntitle="[^"]+"\nid="${MACHINE_ID}-${OLD}"\n`));
   assert.match(info, /index=1\nkernel="\/boot\/vmlinuz-0-rescue-/);
   assert.match(out(sh, `sudo grubby --info=/boot/vmlinuz-${OLD}`), /^index=0\n/);
   assert.match(out(sh, 'sudo grubby --info=DEFAULT'), /^index=0\n/);
@@ -122,13 +124,16 @@ test('dnf installs a new kernel next to the old one, and reboot starts it', () =
   assert.equal(sh.lastCode, 100);
   assert.match(out(sh, 'dnf update kernel'), /has to be run with superuser privileges/);
   assert.match(out(sh, 'dnf install kernel'), /has to be run with superuser privileges/);
-  assert.match(out(sh, 'dnf list kernel'), /Installed packages\nkernel\.x86_64 +6\.12\.0-55\.el10 +anaconda\n\nAvailable packages\nkernel\.x86_64 +6\.12\.0-124\.el10/);
+  // RHEL 10 has dnf 4: its list, transaction table and messages
+  assert.match(out(sh, 'dnf list kernel'), /^Not root, Subscription Management repositories not updated\nLast metadata expiration check: \d+:\d\d:\d\d ago on \w{3} \d\d \w{3} \d{4} \d\d:\d\d:\d\d [AP]M EDT\.\nInstalled Packages\nkernel\.x86_64 +6\.12\.0-55\.el10 +@anaconda\nAvailable Packages\nkernel\.x86_64 +6\.12\.0-124\.el10 +rhel-10-for-x86_64-baseos-rpms\n$/);
+  assert.match(out(sh, 'dnf info kernel'), /Installed Packages\nName {9}: kernel\nVersion {6}: 6\.12\.0\nRelease {6}: 55\.el10\n[\s\S]*\nAvailable Packages\nName {9}: kernel\n[\s\S]*Release {6}: 124\.el10\n/);
 
   const res = out(sh, 'sudo dnf update -y kernel');
-  assert.match(res, /Installing:\n kernel +x86_64 6\.12\.0-124\.el10 /);
-  assert.match(res, /kernel-core +x86_64 6\.12\.0-124\.el10/);
-  assert.match(res, /Complete!/);
-  assert.doesNotMatch(res, /Removing:/);
+  assert.match(res, /^Updating Subscription Management repositories\.\nLast metadata expiration check: .*\nDependencies resolved\.\n=+\n Package +Arch +Version +Repository +Size\n=+\nInstalling:\n kernel +x86_64 +6\.12\.0-124\.el10 +rhel-10-for-x86_64-baseos-rpms +1\.6 M\n/);
+  assert.match(res, /\n kernel-core +x86_64 +6\.12\.0-124\.el10 /);
+  assert.match(res, /\nTransaction Summary\n=+\nInstall  4 Packages\n\nTotal download size: 91 M\n/);
+  assert.match(res, /\nInstalled:\n  kernel-6\.12\.0-124\.el10\.x86_64\n  kernel-core-6\.12\.0-124\.el10\.x86_64\n[\s\S]*\n\nComplete!\n/);
+  assert.doesNotMatch(res, /Removing:|Repositories loaded/);
   assert.equal(out(sh, 'rpm -q kernel'), `kernel-${OLD}\nkernel-${NEW}\n`);
   assert.ok(nodeAt(sh.state.root, `/boot/vmlinuz-${NEW}`));
   assert.ok(nodeAt(sh.state.root, `/usr/lib/modules/${NEW}/kernel/drivers/block/loop.ko.xz`));
@@ -139,10 +144,11 @@ test('dnf installs a new kernel next to the old one, and reboot starts it', () =
   assert.match(out(sh, 'cat /proc/cmdline'), /vmlinuz-6\.12\.0-55\.el10/);
   assert.equal(bootEntries(sh.state)[0].version, NEW);
 
-  assert.match(out(sh, 'sudo dnf update kernel'), /Nothing to do\./);
-  assert.match(out(sh, 'sudo dnf install kernel'), /Package "kernel-6\.12\.0-124\.el10\.x86_64" is already installed\./);
+  assert.match(out(sh, 'sudo dnf update kernel'), /\nDependencies resolved\.\nNothing to do\.\nComplete!\n$/);
+  assert.match(out(sh, 'sudo dnf install kernel'), /\nPackage kernel-6\.12\.0-124\.el10\.x86_64 is already installed\.\nDependencies resolved\.\nNothing to do\.\nComplete!\n$/);
   assert.match(out(sh, 'sudo dnf update'), /Nothing to do\./);
-  assert.equal(out(sh, 'dnf check-update'), 'Updating and loading repositories:\nRepositories loaded.\n');
+  assert.match(out(sh, 'dnf check-update'), /^Not root, Subscription Management repositories not updated\nLast metadata expiration check: [^\n]+\n$/);
+  assert.equal(sh.lastCode, 0);
   // normal packages still go through dnf
   assert.match(out(sh, 'sudo dnf install -y tmux'), /Installing: tmux/);
 
@@ -154,12 +160,33 @@ test('dnf installs a new kernel next to the old one, and reboot starts it', () =
   // the running kernel is protected; the old one can go
   assert.match(out(sh, 'sudo dnf remove kernel-6.12.0-124.el10'), /removing of running kernel: kernel-core-6\.12\.0-124\.el10\.x86_64/);
   assert.match(out(sh, 'sudo dnf remove kernel'), /removing of running kernel/);
-  assert.match(out(sh, 'sudo dnf remove -y kernel-6.12.0-55.el10'), /Removing:\n kernel +x86_64 6\.12\.0-55\.el10 +@System/);
+  assert.match(out(sh, 'sudo dnf remove -y kernel-6.12.0-55.el10'), /^Updating Subscription Management repositories\.\nDependencies resolved\.\n[\s\S]*Removing:\n kernel +x86_64 +6\.12\.0-55\.el10 +@anaconda +0 *\nRemoving unused dependencies:\n kernel-core [\s\S]*\nRemove   4 Packages\n\nFreed space: 140 M\n[\s\S]*\nRemoved:\n  kernel-6\.12\.0-55\.el10\.x86_64\n/);
   assert.equal(out(sh, 'rpm -q kernel'), `kernel-${NEW}\n`);
   assert.equal(nodeAt(sh.state.root, `/boot/vmlinuz-${OLD}`), null);
   assert.equal(nodeAt(sh.state.root, ENTRY), null);
   assert.equal(nodeAt(sh.state.root, `/usr/lib/modules/${OLD}`), null);
-  assert.match(out(sh, 'sudo dnf remove kernel-6.12.0-1.el10'), /No packages to remove for argument/);
+  assert.match(out(sh, 'sudo dnf remove kernel-6.12.0-1.el10'), /\nNo match for argument: kernel-6\.12\.0-1\.el10\nNo packages marked for removal\.\nDependencies resolved\.\nNothing to do\.\nComplete!\n$/);
+  assert.equal(sh.lastCode, 0);
+});
+
+test('dnf with kernel and other packages in one command', () => {
+  const sh = new Shell();
+  const res = out(sh, 'sudo dnf install -y kernel tmux');
+  assert.doesNotMatch(res, /No match for argument/);
+  assert.equal(res.match(/Last metadata expiration check/g)?.length, 1);
+  assert.deepEqual(sh.state.kernel.installed, [OLD, NEW]);
+  assert.match(out(sh, 'rpm -q tmux'), /^tmux-/);
+  // dnf changes nothing when a part of the request cannot be done
+  const sh2 = new Shell();
+  assert.match(out(sh2, 'sudo dnf install -y kernel-6.12.0-999.el10 httpd'), /No match for argument: kernel-6\.12\.0-999\.el10\nError: Unable to find a match: kernel-6\.12\.0-999\.el10\n$/);
+  assert.equal(sh2.lastCode, 1);
+  assert.match(out(sh2, 'rpm -q httpd'), /not installed/);
+  out(sh2, 'sudo dnf install -y httpd');
+  assert.match(out(sh2, 'sudo dnf remove -y kernel httpd'), /removing of running kernel/);
+  assert.match(out(sh2, 'rpm -q httpd'), /^httpd-/);
+  // update: the kernel part still happens
+  out(sh2, 'sudo dnf update -y kernel httpd');
+  assert.deepEqual(sh2.state.kernel.installed, [OLD, NEW]);
 });
 
 test('dnf update without packages installs the kernel; -x kernel* skips it', () => {
@@ -179,7 +206,9 @@ test('installonly_limit keeps three kernels and never removes the running one', 
   sh.state.kernel.running = '6.12.0-10.el10.x86_64'; // booted the oldest one
   assert.deepEqual(sh.state.kernel.installed, ['6.12.0-10.el10.x86_64', '6.12.0-31.el10.x86_64', OLD]);
   const res = out(sh, 'sudo dnf update -y kernel');
-  assert.match(res, /Removing:\n kernel +x86_64 6\.12\.0-31\.el10 +@System/);
+  assert.match(res, /Removing:\n kernel +x86_64 +6\.12\.0-31\.el10 +@System/);
+  assert.match(res, /\nInstall  4 Packages\nRemove   4 Packages\n/);
+  assert.match(res, /\nRemoved:\n  kernel-6\.12\.0-31\.el10\.x86_64\n/);
   assert.match(res, /installonly_limit=3/);
   assert.deepEqual(sh.state.kernel.installed, ['6.12.0-10.el10.x86_64', OLD, NEW]);
   assert.equal(bootEntries(sh.state).filter((e) => e.version.startsWith('6.12.0-31')).length, 0);
@@ -209,10 +238,11 @@ test('grubby changes kernel arguments; /proc/cmdline follows after a reboot', ()
   for (const e of bootEntries(sh.state)) {
     assert.ok(entryHasArg(e, 'audit=1') && entryHasArg(e, 'quiet'), e.id);
   }
-  assert.match(file(sh, '/etc/default/grub')!, /^GRUB_CMDLINE_LINUX="crashkernel=\S+ resume=\/dev\/mapper\/rhel-swap rd\.lvm\.lv=rhel\/root rd\.lvm\.lv=rhel\/swap audit=1 quiet"$/m);
+  // quiet was there already: grubby drops the old one and appends the new arguments
+  assert.match(file(sh, '/etc/default/grub')!, /^GRUB_CMDLINE_LINUX="crashkernel=\S+ resume=\/dev\/mapper\/rhel-swap rd\.lvm\.lv=rhel\/root rd\.lvm\.lv=rhel\/swap rhgb audit=1 quiet"$/m);
   assert.doesNotMatch(out(sh, 'cat /proc/cmdline'), /audit=1/);
   out(sh, 'sudo reboot');
-  assert.match(out(sh, 'cat /proc/cmdline'), /rd\.lvm\.lv=rhel\/swap audit=1 quiet\n$/);
+  assert.match(out(sh, 'cat /proc/cmdline'), /rd\.lvm\.lv=rhel\/swap rhgb audit=1 quiet\n$/);
 
   // key=value replaces the old value; --remove-args takes keys or exact words
   out(sh, 'sudo grubby --update-kernel=ALL --args=audit=0 --remove-args=quiet');
@@ -235,6 +265,35 @@ test('grubby changes kernel arguments; /proc/cmdline follows after a reboot', ()
   assert.doesNotMatch(file(sh, '/etc/default/grub')!, /quiet/);
 
   assert.equal(updatedOptions('a b=1 c', ['c'], ['b=2', 'd']), 'a b=2 d');
+  assert.equal(updatedOptions('a console=tty1 b', [], ['console=tty0', 'console=ttyS0,115200']), 'a b console=tty0 console=ttyS0,115200');
+});
+
+test('grubby keeps two values of one argument, and updates every GRUB_CMDLINE_LINUX line', () => {
+  const sh = new Shell();
+  assert.equal(out(sh, 'sudo grubby --update-kernel=ALL --args="console=tty0 console=ttyS0,115200"'), '');
+  for (const e of bootEntries(sh.state)) assert.match(e.options, / console=tty0 console=ttyS0,115200$/, e.id);
+  assert.match(file(sh, '/etc/default/grub')!, /^GRUB_CMDLINE_LINUX=".* rhgb quiet console=tty0 console=ttyS0,115200"$/m);
+  assert.match(out(sh, 'sudo grubby --info=DEFAULT'), /^args=".* console=tty0 console=ttyS0,115200"$/m);
+
+  // a second GRUB_CMDLINE_LINUX line (echo >> is the editor here): grubby-bls rewrites both with sed
+  const sh2 = new Shell();
+  out(sh2, `echo 'GRUB_CMDLINE_LINUX="${DEFAULT_KERNEL_ARGS} audit=1"' | sudo tee -a /etc/default/grub`);
+  out(sh2, 'sudo grubby --update-kernel=ALL --remove-args=audit --args=nomodeset');
+  const lines = file(sh2, '/etc/default/grub')!.split('\n').filter((l) => l.startsWith('GRUB_CMDLINE_LINUX='));
+  assert.equal(lines.length, 2);
+  for (const l of lines) assert.equal(l, `GRUB_CMDLINE_LINUX="${DEFAULT_KERNEL_ARGS} nomodeset"`);
+  out(sh2, 'sudo grub2-mkconfig -o /boot/grub2/grub.cfg --update-bls-cmdline');
+  assert.ok(!entryHasArg(defaultBootEntry(sh2.state)!, 'audit'));
+});
+
+test('grubby finds a kernel by its file name or by TITLE=', () => {
+  const sh = new Shell();
+  out(sh, `sudo grubby --update-kernel=vmlinuz-${OLD} --args=nomodeset`);
+  assert.ok(entryHasArg(bootEntries(sh.state)[0], 'nomodeset'));
+  assert.ok(!entryHasArg(bootEntries(sh.state)[1], 'nomodeset'), 'the rescue entry has another kernel');
+  assert.match(out(sh, `sudo grubby --info=/vmlinuz-${OLD}`), /^index=0\n/);
+  assert.match(out(sh, `sudo grubby --info="TITLE=Red Hat Enterprise Linux (${OLD}) 10.0 (Coughlan)"`), /^index=0\n/);
+  assert.match(out(sh, 'sudo grubby --info="TITLE=Red Hat"'), /The param TITLE=Red Hat is incorrect/);
 });
 
 test('editing /etc/default/grub needs grub2-mkconfig --update-bls-cmdline', () => {
@@ -254,7 +313,7 @@ test('editing /etc/default/grub needs grub2-mkconfig --update-bls-cmdline', () =
 
   out(sh, 'sudo grub2-mkconfig -o /boot/grub2/grub.cfg --update-bls-cmdline');
   for (const e of bootEntries(sh.state)) {
-    assert.match(e.options, /^root=\/dev\/mapper\/rhel-root ro console=ttyS0 crashkernel=\S+ resume=\/dev\/mapper\/rhel-swap rd\.lvm\.lv=rhel\/root rd\.lvm\.lv=rhel\/swap$/, e.id);
+    assert.match(e.options, /^root=\/dev\/mapper\/rhel-root ro console=ttyS0 crashkernel=\S+ resume=\/dev\/mapper\/rhel-swap rd\.lvm\.lv=rhel\/root rd\.lvm\.lv=rhel\/swap rhgb quiet$/, e.id);
   }
   assert.doesNotMatch(out(sh, 'cat /proc/cmdline'), /console=ttyS0/);
   out(sh, 'sudo reboot');
@@ -676,7 +735,19 @@ test('boot targets: default target, systemd.unit= and runlevel words', () => {
   assert.equal(sh.state.kernel.emergency, true);
 
   out(sh, 'grubby --update-kernel=ALL --remove-args=emergency --args=systemd.unit=bogus.target');
-  assert.match(out(sh, 'reboot'), /^Failed to load default target: Unit bogus\.target not found\.\nFalling back to rescue\.target\.\n/);
+  assert.match(out(sh, 'reboot'), /^Unit bogus\.target not found\.\nFalling back to rescue\.target\.\n/);
+  assert.equal(sh.state.kernel.bootTarget, 'rescue.target');
+
+  // systemd ignores a unit name without its type; emergency.service works like emergency.target
+  out(sh, 'grubby --update-kernel=ALL --remove-args=systemd.unit --args=systemd.unit=rescue');
+  assert.match(out(sh, 'reboot'), /target graphical\.target\. You are logged in as student again\.\)\n\(Practice note: systemd ignored systemd\.unit=rescue, /);
+  assert.equal(sh.state.kernel.bootTarget, 'graphical.target', 'the default target (set above)');
+  assert.match(out(sh, 'sudo journalctl -b'), /systemd\[1\]: Unit name specified on systemd\.unit= is not valid, ignoring: rescue\n/);
+  out(sh, 'sudo grubby --update-kernel=ALL --remove-args=systemd.unit --args=systemd.unit=emergency.service');
+  assert.match(out(sh, 'sudo reboot'), /You are in emergency mode/);
+  assert.equal(sh.state.kernel.bootTarget, 'emergency.target');
+  out(sh, 'grubby --update-kernel=ALL --remove-args=systemd.unit --args=systemd.unit=rescue.service');
+  out(sh, 'reboot');
   assert.equal(sh.state.kernel.bootTarget, 'rescue.target');
 
   out(sh, 'grubby --update-kernel=ALL --remove-args=systemd.unit --args=3');
@@ -692,14 +763,21 @@ test('fstab errors at boot put the server in emergency mode until a clean reboot
   const sh = new Shell();
   const err = 'mount: /data: special device /dev/vgdata/lvdata does not exist.';
   const res = withStorage([err], () => out(sh, 'sudo reboot'));
-  assert.match(res, /^mount: \/data: special device \/dev\/vgdata\/lvdata does not exist\.\n\[DEPEND\] Dependency failed for local-fs\.target - Local File Systems\.\nYou are in emergency mode\./);
+  // systemd's messages, not mount(8)'s: it waits for the device unit, then gives up
+  assert.match(res, /^\[ TIME \] Timed out waiting for device dev-vgdata-lvdata\.device - \/dev\/vgdata\/lvdata\.\n\[DEPEND\] Dependency failed for data\.mount - \/data\.\n\[DEPEND\] Dependency failed for local-fs\.target - Local File Systems\.\nYou are in emergency mode\./);
   assert.match(res, /Give root password for maintenance/);
   assert.match(res, /target emergency\.target\. The boot stopped because of the errors above\./);
+  assert.match(res, /then type "exit" to continue the boot/);
   assert.equal(sh.state.kernel.emergency, true);
   assert.equal(sh.state.kernel.bootTarget, 'emergency.target');
   assert.deepEqual(sh.state.kernel.bootErrors, [err]);
   assert.equal(sh.prompt(), '[root@server1 ~]# ');
-  assert.match(out(sh, 'journalctl'), /systemd\[1\]: mount: \/data: special device \/dev\/vgdata\/lvdata does not exist\.\n.*Dependency failed for local-fs\.target/);
+  const log = out(sh, 'journalctl');
+  assert.match(log, /systemd\[1\]: dev-vgdata-lvdata\.device: Job dev-vgdata-lvdata\.device\/start timed out\.\n.*systemd\[1\]: Timed out waiting for device dev-vgdata-lvdata\.device - \/dev\/vgdata\/lvdata\.\n.*systemd\[1\]: Dependency failed for data\.mount - \/data\.\n/);
+  assert.match(log, /systemd\[1\]: Dependency failed for local-fs\.target - Local File Systems\.\n.*local-fs\.target: Job local-fs\.target\/start failed with result 'dependency'\.\n.*local-fs\.target: Triggering OnFailure= dependencies\.\n/);
+  assert.doesNotMatch(log, /systemd\[1\]: mount:/);
+  // after an fstab failure systemd-remount-fs has run: / is read-write
+  assert.match(out(sh, 'findmnt -n -o OPTIONS /'), /^rw,/);
 
   const clean = withStorage([], () => out(sh, 'systemctl reboot'));
   assert.match(clean, /target multi-user\.target\. You are logged in as student again/);
@@ -713,6 +791,119 @@ test('fstab errors at boot put the server in emergency mode until a clean reboot
   assert.match(locked, /Cannot open access to console, the root account is locked\.\nSee sulogin\(8\) man page for more details\.\n\nPress Enter to continue\.\n/);
   assert.match(locked, /rd\.break or init=\/bin\/bash/);
   assert.equal(sh.user.name, 'root');
+});
+
+test('boot messages for a bad UUID, a failed mount and a failed swap line', () => {
+  const sh = new Shell();
+  const uuid = 'mount: /data: can\'t find UUID=5d3e8f21-aaaa-bbbb-cccc-1234567890ab.';
+  const bad = 'mount: /web: wrong fs type, bad option, bad superblock on /dev/nvme0n2p1, missing codepage or helper program, or other error.';
+  const swap = 'swapon: cannot find the device for UUID=1234-abcd';
+  const res = withStorage({ errors: [uuid, bad], warnings: [swap] }, () => out(sh, 'sudo reboot'));
+  assert.match(res, /^\[ TIME \] Timed out waiting for device dev-disk-by\\x2duuid-5d3e8f21\\x2daaaa\\x2dbbbb\\x2dcccc\\x2d1234567890ab\.device - \/dev\/disk\/by-uuid\/5d3e8f21-aaaa-bbbb-cccc-1234567890ab\.\n\[DEPEND\] Dependency failed for data\.mount - \/data\.\n/);
+  assert.match(res, /\n\[FAILED\] Failed to mount web\.mount - \/web\.\nSee 'systemctl status web\.mount' for details\.\n\[DEPEND\] Dependency failed for local-fs\.target - Local File Systems\.\n/);
+  assert.match(res, /\n\[DEPEND\] Dependency failed for dev-disk-by\\x2duuid-1234\\x2dabcd\.swap - \/dev\/disk\/by-uuid\/1234-abcd\.\n\[DEPEND\] Dependency failed for swap\.target - Swaps\.\nYou are in emergency mode/);
+  assert.deepEqual(sh.state.kernel.bootErrors, [uuid, bad]);
+  const log = out(sh, 'journalctl -b');
+  assert.match(log, /systemd\[1\]: Mounting web\.mount - \/web\.\.\.\n.* mount\[\d+\]: mount: \/web: wrong fs type, [^\n]*\n.*web\.mount: Mount process exited, code=exited, status=32\/n\/a\n.*web\.mount: Failed with result 'exit-code'\.\n.*systemd\[1\]: Failed to mount web\.mount - \/web\.\n/);
+  assert.match(out(sh, 'journalctl -b -p err'), /Timed out waiting for device dev-disk-by\\x2duuid-5d3e8f21/);
+
+  // a swap failure alone is logged, but the boot goes on
+  const sw = withStorage({ errors: [], warnings: ['swapon: /dev/nvme0n2p1: read swap header failed'] }, () => out(sh, 'systemctl reboot'));
+  assert.match(sw, /^\[FAILED\] Failed to activate swap dev-nvme0n2p1\.swap - \/dev\/nvme0n2p1\.\nSee 'systemctl status dev-nvme0n2p1\.swap' for details\.\n\[DEPEND\] Dependency failed for swap\.target - Swaps\.\nRed Hat Enterprise Linux/);
+  assert.equal(sh.state.kernel.bootTarget, 'multi-user.target');
+  assert.deepEqual(sh.state.kernel.bootErrors, []);
+  assert.match(out(sh, 'sudo journalctl -b'), /swapon\[\d+\]: swapon: \/dev\/nvme0n2p1: read swap header failed\n/);
+});
+
+test('emergency mode from a kernel argument: / is read-only, and exit continues the boot', () => {
+  const sh = new Shell();
+  out(sh, 'sudo grubby --update-kernel=ALL --args=emergency');
+  assert.match(out(sh, 'sudo reboot'), /\/ is mounted read-only in emergency mode: run "mount -o remount,rw \/"/);
+  assert.match(out(sh, 'findmnt -n -o OPTIONS /'), /^ro,/);
+  out(sh, 'mount -o remount,rw /');
+  assert.match(out(sh, 'findmnt -n -o OPTIONS /'), /^rw,/);
+  out(sh, 'mount -o remount,ro /');
+  // "exit" leaves the emergency shell and goes on to the default target
+  assert.match(out(sh, 'exit'), /reached multi-user\.target/);
+  assert.equal(sh.state.kernel.bootTarget, 'multi-user.target');
+  assert.equal(sh.user.name, 'student');
+  // the next boot remounts / with its /etc/fstab options; rescue.target also gets there
+  out(sh, 'sudo grubby --update-kernel=ALL --remove-args=emergency --args=systemd.unit=rescue.target');
+  assert.match(out(sh, 'sudo reboot'), /Type "exit" \(or "systemctl default"\) to continue to multi-user\.target/);
+  assert.match(out(sh, 'findmnt -n -o OPTIONS /'), /^rw,/);
+  assert.match(out(sh, 'systemctl default'), /logged in as student again/);
+});
+
+test('a reboot brings back a fresh /proc and /sys, and a fresh login shell', () => {
+  const sh = new Shell();
+  out(sh, 'sudo rm -f /proc/cmdline /proc/version /proc/mounts');
+  out(sh, 'sudo rm -rf /proc/sys/vm');
+  out(sh, 'sudo touch /proc/sys/vm');
+  out(sh, 'sudo rm -rf /sys/module');
+  out(sh, 'sudo touch /sys/module');
+  out(sh, 'f() { echo func; }');
+  assert.match(out(sh, 'sudo reboot'), /Practice server rebooted/);
+  assert.equal(sh.state.kernel.boots, 1);
+  assert.match(out(sh, 'cat /proc/cmdline'), /^BOOT_IMAGE=/);
+  assert.match(out(sh, 'cat /proc/version'), /^Linux version /);
+  assert.match(out(sh, 'cat /proc/mounts'), /^\/dev\/mapper\/rhel-root \/ xfs /m);
+  assert.equal(out(sh, 'sysctl vm.swappiness'), 'vm.swappiness = 30\n');
+  assert.ok(nodeAt(sh.state.root, '/sys/module/xfs'));
+  assert.match(out(sh, 'f'), /f: command not found/);
+});
+
+test('shutdown -r takes minutes with or without +', () => {
+  const sh = new Shell();
+  assert.match(out(sh, 'sudo shutdown -r 0'), /^Reboot scheduled for .*, use 'shutdown -c' to cancel\.\nRed Hat Enterprise Linux/);
+  assert.match(out(sh, 'sudo shutdown -r 5'), /^Reboot scheduled for .*\n\(Practice server: not waiting for it\.\)\n/);
+  assert.equal(sh.state.kernel.boots, 2);
+  assert.match(out(sh, 'sudo shutdown -r -5'), /Failed to parse time specification/);
+});
+
+test('rpm -qa --last, globs and --queryformat know the kernel packages', () => {
+  const sh = new Shell();
+  out(sh, 'sudo dnf install -y kernel');
+  const last = out(sh, 'rpm -qa --last').split('\n');
+  assert.deepEqual(last.slice(0, 4).map((l) => l.split(/ +/)[0]).sort(), [`kernel-${NEW}`, `kernel-core-${NEW}`, `kernel-modules-${NEW}`, `kernel-modules-core-${NEW}`]);
+  assert.match(last[0], /^kernel-\S+ +\w{3} \d\d \w{3} \d{4} \d\d:\d\d:\d\d [AP]M EDT$/);
+  assert.ok(last.some((l) => l.startsWith('bash-')));
+  assert.equal(out(sh, "rpm -qa 'kernel-mod*'"), [OLD, NEW].flatMap((r) => [`kernel-modules-core-${r}`, `kernel-modules-${r}`]).join('\n') + '\n');
+  assert.equal(out(sh, `rpm -qa 'kernel-core-6.12.0-1*'`), `kernel-core-${NEW}\n`);
+  assert.equal(out(sh, "rpm -q --qf '%{VERSION}-%{RELEASE}\\n' kernel"), '6.12.0-55.el10\n6.12.0-124.el10\n');
+  assert.equal(out(sh, "rpm -q --queryformat='%{NAME}.%{ARCH}\\n' kernel-core bash"), 'kernel-core.x86_64\nkernel-core.x86_64\nbash.x86_64\n');
+  assert.match(out(sh, "rpm -q --qf '%{NOPE}' kernel"), /unknown tag/);
+  assert.match(out(sh, 'rpm -q kernel nosuch'), new RegExp(`^kernel-${OLD.replace(/\./g, '\\.')}\nkernel-[^\n]+\npackage nosuch is not installed\n$`));
+  assert.equal(sh.lastCode, 1);
+});
+
+test('a module that may not load automatically cannot be mounted', () => {
+  const sh = new Shell();
+  assert.ok(!isLoaded(sh.state, 'ext4'));
+  out(sh, 'echo "install ext4 /bin/false" | sudo tee /etc/modprobe.d/noext4.conf');
+  assert.equal(loadFsModule(sh.state, 'ext4'), false);
+  assert.ok(!isLoaded(sh.state, 'ext4'));
+  out(sh, 'echo "blacklist isofs" | sudo tee /etc/modprobe.d/noiso.conf');
+  assert.equal(loadFsModule(sh.state, 'iso9660'), false);
+  // the others load through the fs- alias with their options; xfs is loaded already
+  out(sh, 'echo "options overlay index=1" | sudo tee /etc/modprobe.d/overlay.conf');
+  assert.equal(loadFsModule(sh.state, 'overlay'), true);
+  assert.equal(moduleParam(sh.state, 'overlay', 'index'), 'Y');
+  assert.equal(loadFsModule(sh.state, 'xfs'), true);
+  assert.equal(loadFsModule(sh.state, 'tmpfs'), true);
+  // already loaded: the install line no longer matters
+  out(sh, 'sudo rm /etc/modprobe.d/noext4.conf');
+  assert.equal(loadFsModule(sh.state, 'ext4'), true);
+  out(sh, 'echo "install ext4 /bin/false" | sudo tee /etc/modprobe.d/noext4.conf');
+  assert.equal(loadFsModule(sh.state, 'ext2'), true);
+});
+
+test('dmesg shows the root file system UUID that blkid shows', () => {
+  const sh = new Shell();
+  const uuid = /UUID="([^"]+)"/.exec(out(sh, 'sudo blkid /dev/mapper/rhel-root'))![1];
+  assert.match(out(sh, 'dmesg'), new RegExp(`XFS \\(dm-0\\): Mounting V5 Filesystem ${uuid}\n`));
+  out(sh, 'sudo reboot');
+  assert.match(out(sh, 'dmesg'), new RegExp(`XFS \\(dm-0\\): Mounting V5 Filesystem ${uuid}\n`));
+  assert.equal(mountedAt(sh.state, '/')?.source, '/dev/mapper/rhel-root');
 });
 
 test('GRUB falls back when kernel files are missing; dracut rebuilds the initramfs', () => {

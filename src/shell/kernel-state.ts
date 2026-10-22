@@ -6,7 +6,7 @@
 // only exists in the running kernel: which kernel booted, its arguments and the loaded modules.
 import { FsNode, makeDir, makeFile, makeLink } from './fs';
 import type { SystemState } from './state';
-import { STORAGE_FILES } from './storage-state';
+import { STORAGE_FILES, findDevice } from './storage-state';
 
 // ---------- constants ----------
 
@@ -18,12 +18,16 @@ export const UPDATE_KERNEL = '6.12.0-124.el10.x86_64';
 export const REPO_KERNELS = [RUNNING_KERNEL, UPDATE_KERNEL];
 export const MACHINE_ID = '4f6c2a9e8b1d4c7a9e3f5b2d6a8c1e07';
 export const ROOT_DEVICE = '/dev/mapper/rhel-root';
-/** GRUB_CMDLINE_LINUX of a fresh RHEL 10 install with LVM. */
+/**
+ * GRUB_CMDLINE_LINUX of a fresh RHEL 10 install with LVM. The installer adds "rhgb quiet" because
+ * plymouth (the boot splash) is part of @core.
+ */
 export const DEFAULT_KERNEL_ARGS =
-  'crashkernel=2G-64G:256M,64G-:512M resume=/dev/mapper/rhel-swap rd.lvm.lv=rhel/root rd.lvm.lv=rhel/swap';
+  'crashkernel=2G-64G:256M,64G-:512M resume=/dev/mapper/rhel-swap rd.lvm.lv=rhel/root rd.lvm.lv=rhel/swap rhgb quiet';
 export const DEFAULT_OPTIONS = `root=${ROOT_DEVICE} ro ${DEFAULT_KERNEL_ARGS}`;
 const BOOT_DEVICE = '(hd0,gpt2)'; // /boot is the second GPT partition
 const BOOT_UUID = '4c8a1e2b-7f3d-4a8e-9c1b-2d5e6f7a8b9c';
+const ROOT_FS_UUID = 'a3f7c2d1-5b8e-4f6a-9d2c-1e7b3a5f8c4d'; // the XFS file system on rhel-root, as blkid shows it
 export const OS_TITLE = 'Red Hat Enterprise Linux';
 export const OS_VERSION = '10.0 (Coughlan)';
 export const ENTRIES_DIR = '/boot/loader/entries';
@@ -707,8 +711,11 @@ export interface KernelState {
 
 export const cmdlineFor = (linux: string, options: string) => `BOOT_IMAGE=${BOOT_DEVICE}${linux} ${options}`.trim();
 
+/** The UUID of the root file system, from the storage simulation. */
+export const rootFsUuid = (state: SystemState) => findDevice(state.storage, ROOT_DEVICE)?.holder.fs?.uuid ?? ROOT_FS_UUID;
+
 /** The kernel ring buffer right after booting `release` with `cmdline`. */
-export function bootLog(release: string, cmdline: string): DmesgLine[] {
+export function bootLog(release: string, cmdline: string, rootUuid = ROOT_FS_UUID): DmesgLine[] {
   const l = (t: number, msg: string, level: DmesgLevel = 'info'): DmesgLine => ({ t, level, msg });
   return [
     l(0, linuxVersionLine(release), 'notice'),
@@ -720,7 +727,7 @@ export function bootLog(release: string, cmdline: string): DmesgLine[] {
     l(1.204117, 'nvme nvme0: 2/0/0 default/read/poll queues'),
     l(1.211342, ' nvme0n1: p1 p2 p3'),
     l(2.318645, 'SGI XFS with ACLs, security attributes, scrub, quota, no debug enabled', 'notice'),
-    l(2.329873, 'XFS (dm-0): Mounting V5 Filesystem 1f6e2c3a-9b8d-4e7f-a6c5-3d2b1a0f9e8d', 'notice'),
+    l(2.329873, `XFS (dm-0): Mounting V5 Filesystem ${rootUuid}`, 'notice'),
     l(2.371207, 'XFS (dm-0): Ending clean mount'),
     l(3.120554, 'systemd[1]: systemd 257-9.el10 running in system mode (+PAM +AUDIT +SELINUX -APPARMOR +IMA +SECCOMP +ACL +BLKID +KMOD +PWQUALITY +TPM2 +XZ +ZSTD)'),
     l(3.981236, 'vmxnet3 0000:0b:00.0 ens160: renamed from eth0'),
@@ -993,6 +1000,27 @@ export function syncMountModules(state: SystemState): void {
   }
 }
 
+/**
+ * Mounting a file system type whose driver is not loaded makes the kernel call
+ * request_module("fs-TYPE"), which runs modprobe on that alias. A blacklist line, an install
+ * command such as "install ext4 /bin/false" or a blacklist kernel argument stops it, and the
+ * mount then fails with "unknown filesystem type". Returns false in that case, true when the
+ * type can be mounted (its module was already loaded, loads now, or it needs none).
+ */
+export function loadFsModule(state: SystemState, fsType: string): boolean {
+  const m = FS_MODULE[fsType];
+  if (!m || isLoaded(state, m)) return true;
+  const cfg = modprobeConfig(state.root);
+  if (autoloadBlocked(state, m, cfg)) return false;
+  const dir = `/usr/lib/modules/${state.kernel.running}`;
+  for (const d of moduleDeps(m)) {
+    if (isLoaded(state, d)) continue;
+    if (nodeAt(state.root, `${dir}/${MODULES[d].path}`)?.type !== 'file') return false;
+    if (insertModule(state, d, { ...cfg.options[d], ...cmdlineParams(state, d) })) return false;
+  }
+  return true;
+}
+
 /** Is `name` kept from loading automatically (blacklist line, install /bin/false, kernel argument)? */
 export function autoloadBlocked(state: SystemState, name: string, cfg = modprobeConfig(state.root)): boolean {
   const cl = cmdlineBlacklist(state);
@@ -1103,6 +1131,34 @@ export function addKernelFiles(root: FsNode): void {
     putFile(root, sysctlPath(key), sysctlDefault(key, null) + '\n', s.readonly ? 0o444 : 0o644);
   }
   for (const n of new Set(BOOT_MODULES.flatMap(moduleDeps))) writeModuleSysfs(root, n, {});
+}
+
+/** Make `name` in `dir` a directory (an empty one if `fresh`), replacing whatever else is there. */
+function forceDir(dir: FsNode, name: string, mode: number, fresh = false): FsNode {
+  const cur = dir.children![name];
+  if (cur?.type === 'dir' && !fresh) return cur;
+  return (dir.children![name] = makeDir(0, 0, mode));
+}
+
+/**
+ * A boot mounts a new procfs and sysfs: whatever was deleted or put there before the reboot is
+ * gone, and /proc/cmdline, /proc/modules and /proc/version are back. The tunables in /proc/sys and
+ * the modules in /sys/module are filled in again by the boot (resetSysctls, insertModule).
+ */
+export function resetKernelFs(root: FsNode): void {
+  const proc = forceDir(root, 'proc', 0o555);
+  for (const f of ['cmdline', 'modules', 'version']) proc.children![f] = makeFile('', 0, 0, 0o444);
+  forceDir(proc, 'sys', 0o755, true);
+  forceDir(forceDir(root, 'sys', 0o555), 'module', 0o755, true);
+  // the files the storage simulation fills in (/proc/mounts, /proc/swaps, ...) are back too
+  for (const p of Object.keys(STORAGE_FILES)) {
+    if (!p.startsWith('/proc/') || nodeAt(root, p)) continue;
+    try {
+      putFile(root, p, '', 0o444);
+    } catch {
+      // something that is not a directory is in the way; the file stays missing
+    }
+  }
 }
 
 /** /proc/modules: name size refcount holders state address, newest first. */

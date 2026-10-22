@@ -92,7 +92,7 @@ test('lab checks never change the system', () => {
 
 // ---------- R16-kernel-args ----------
 
-test('R16-kernel-args: the setup boots with rhgb quiet everywhere', () => {
+test('R16-kernel-args: a fresh install boots with rhgb quiet everywhere', () => {
   const { sh } = start('R16-kernel-args');
   assert.match(out(sh, 'cat /proc/cmdline'), / rd\.lvm\.lv=rhel\/swap rhgb quiet\n$/);
   assert.ok(bootEntries(sh.state).length >= 2);

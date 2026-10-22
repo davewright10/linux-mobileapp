@@ -52,8 +52,10 @@ import {
   removeAt,
   removeKernel,
   removeModule,
+  resetKernelFs,
   resetSysctls,
   resolveEntry,
+  rootFsUuid,
   splitArgs,
   syncMountModules,
   sysctlDFiles,
@@ -67,8 +69,9 @@ import {
   writeSysctl,
 } from './kernel-state';
 import type { Shell } from './shell';
-import { journaldStart } from './journal';
-import { runningHostname } from './state';
+import { journaldStart, mountUnit } from './journal';
+import { AVAILABLE_PACKAGES, pkgKey, runningHostname } from './state';
+import { parseFstab, readFstab } from './storage-state';
 import type { NmConnection, SystemState, User } from './state';
 
 type Command = (ctx: CommandContext) => CommandResult;
@@ -184,20 +187,29 @@ const TARGETS: Record<string, string> = {
   'emergency.target': 'Emergency Mode',
 };
 
-/** The parts of a boot other agents' code provides. Tests may replace them. */
-export const bootSteps = { storage: bootStorage };
+/**
+ * The parts of a boot other agents' code provides. Tests may replace them. The storage step
+ * returns the fstab errors that stop the boot, either as a list or as { errors, warnings }, where
+ * warnings (a swap line, say) are logged but let the boot go on.
+ */
+export const bootSteps: { storage: (sh: Shell) => unknown } = { storage: bootStorage };
 
-type Session = Shell['sessions'][number];
+/** What the storage step reported, whatever its exact shape: messages as mount(8) or swapon(8) print them. */
+function storageResult(r: unknown): { errors: string[]; warnings: string[] } {
+  const text = (x: unknown): string =>
+    typeof x === 'object' && x !== null && 'message' in x ? String((x as { message: unknown }).message) : String(x);
+  const list = (v: unknown) => (Array.isArray(v) ? v.map(text).filter((t) => t.trim()) : []);
+  if (Array.isArray(r)) return { errors: list(r), warnings: [] };
+  const o = (typeof r === 'object' && r !== null ? r : {}) as { errors?: unknown; warnings?: unknown };
+  return { errors: list(o.errors), warnings: list(o.warnings) };
+}
 
 /** Replace every session with a fresh login of `user`, as after logging in again. */
 function freshLogin(sh: Shell, user: User): void {
-  const sessions: Session[] = [{ user, cwd: user.home }];
-  const pop = sessions.pop.bind(sessions);
-  // The login shell itself is never popped. "sudo reboot" pops the session sudo pushed once this
-  // command returns; without this guard that would throw away the new login instead.
-  sessions.pop = () => (sessions.length > 1 ? pop() : sessions[0]);
-  sh.sessions = sessions;
+  // sudo and su notice that the session list was replaced and leave it alone
+  sh.sessions = [{ user, cwd: user.home }];
   sh.env = {};
+  sh.functions = new Map();
 }
 
 const bootPath = (p: string) => (p.startsWith('/boot/') ? p : `/boot${p}`);
@@ -278,6 +290,20 @@ function bootRuntime(state: SystemState, full: boolean, login: User): void {
     .concat({ pid: 1602, user: login.name, cpu: 0, mem: 0.1, nice: 0, cmd: '-bash' });
 }
 
+/**
+ * systemd-remount-fs: the initramfs mounts / read-only (the "ro" argument), and early in the boot
+ * systemd remounts it with the options from /etc/fstab. Booting straight into emergency.target
+ * skips that step, so / stays read-only until "mount -o remount,rw /". Leaving emergency mode for
+ * a normal target runs the step after all (remountRoot(state, false)).
+ */
+export function remountRoot(state: SystemState, readOnly: boolean): void {
+  const root = state.storage.mounts.find((m) => m.target === '/');
+  if (!root) return;
+  const fstab = parseFstab(readFstab(state)).entries.find((e) => e.file === '/' && e.type !== 'swap');
+  const opts = fstab?.options.length ? [...fstab.options] : ['defaults'];
+  root.options = readOnly ? [...opts.filter((o) => !['defaults', 'rw', 'ro'].includes(o)), 'ro'] : opts;
+}
+
 function appendJournal(state: SystemState, lines: string[]): void {
   const log = nodeAt(state.root, '/var/log/messages');
   if (log?.type !== 'file') return;
@@ -286,17 +312,125 @@ function appendJournal(state: SystemState, lines: string[]): void {
   log.content = (log.content ?? '') + lines.map((l) => `${when} ${host} ${l}\n`).join('');
 }
 
-/** The target that kernel arguments ask for (systemd.unit=, rescue, single, emergency, 3, 5). Last one wins. */
-function requestedTarget(args: string[], def: string): string {
+/** systemd.unit= takes a unit name with its type (rescue.target); anything else is ignored. */
+const UNIT_NAME = /^[\w:.\\-]+(?:@[\w:.\\-]+)?\.(?:service|socket|target|device|mount|automount|swap|timer|path|slice|scope)$/;
+
+/**
+ * The target that kernel arguments ask for (systemd.unit=, rescue, single, emergency, 3, 5). Last
+ * one wins. `warnings` gets what systemd logs about arguments it ignores.
+ */
+function requestedTarget(args: string[], def: string, warnings: string[]): string {
   let target = def;
   for (const a of args) {
-    if (a.startsWith('systemd.unit=')) target = a.slice('systemd.unit='.length);
-    else if (['rescue', 'single', 's', 'S', '1'].includes(a)) target = 'rescue.target';
+    if (a.startsWith('systemd.unit=')) {
+      const v = a.slice('systemd.unit='.length);
+      if (!v) warnings.push('Missing argument for systemd.unit= kernel command line switch, ignoring.');
+      else if (!UNIT_NAME.test(v)) warnings.push(`Unit name specified on systemd.unit= is not valid, ignoring: ${v}`);
+      else target = v === 'emergency.service' ? 'emergency.target' : v === 'rescue.service' ? 'rescue.target' : v;
+    } else if (['rescue', 'single', 's', 'S', '1'].includes(a)) target = 'rescue.target';
     else if (a === 'emergency' || a === '-b') target = 'emergency.target';
     else if (['2', '3', '4'].includes(a)) target = 'multi-user.target';
     else if (a === '5') target = 'graphical.target';
   }
   return target === 'default.target' ? def : target;
+}
+
+// ---------- what systemd shows when /etc/fstab or swap fails at boot ----------
+
+/** One failed mount or swap line, with the units systemd shows for it. */
+interface BootFailure {
+  raw: string; // what mount(8) or swapon(8) said, e.g. "mount: /data: can't find UUID=..."
+  unit: string | null; // data.mount, dev-sdb1.swap; null when the message is not understood
+  what: string; // the unit's description: the mount point, or the swap device
+  device: string | null; // a device that never appeared, so systemd waited for it until the timeout
+  swap: boolean;
+}
+
+const BY_TAG: Record<string, string> = { UUID: 'by-uuid', LABEL: 'by-label', PARTUUID: 'by-partuuid', PARTLABEL: 'by-partlabel' };
+/** systemd's unit name for a path: /dev/disk/by-uuid/1a-2b -> dev-disk-by\x2duuid-1a\x2d2b.device */
+const pathUnit = (path: string, type: string) => mountUnit(path).replace(/\.mount$/, `.${type}`);
+
+function parseBootFailure(raw: string): BootFailure {
+  const t = raw.trim();
+  let m: RegExpExecArray | null;
+  if ((m = /^mount: (\/[^:]*): can't find (UUID|LABEL|PARTUUID|PARTLABEL)=(.+?)\.?$/.exec(t))) {
+    return { raw: t, unit: mountUnit(m[1]), what: m[1], device: `/dev/disk/${BY_TAG[m[2]]}/${m[3]}`, swap: false };
+  }
+  if ((m = /^mount: (\/[^:]*): special device (\S+) does not exist\.?$/.exec(t))) {
+    return { raw: t, unit: mountUnit(m[1]), what: m[1], device: m[2], swap: false };
+  }
+  if ((m = /^mount: (\/[^:]*):/.exec(t))) return { raw: t, unit: mountUnit(m[1]), what: m[1], device: null, swap: false };
+  let dev: string | null = null;
+  if ((m = /^swapon: cannot find the device for (UUID|LABEL|PARTUUID|PARTLABEL)=(.+)$/.exec(t))) dev = `/dev/disk/${BY_TAG[m[1]]}/${m[2]}`;
+  else if ((m = /^swapon: cannot open (\/\S+): No such file or directory$/.exec(t))) dev = m[1];
+  if (dev) return { raw: t, unit: pathUnit(dev, 'swap'), what: dev, device: dev, swap: true };
+  if ((m = /^swapon: (\/[^:\s]+):/.exec(t))) return { raw: t, unit: pathUnit(m[1], 'swap'), what: m[1], device: null, swap: true };
+  return { raw: t, unit: null, what: '', device: null, swap: /^swapon:/.test(t) };
+}
+
+/** The console lines for failures (systemd's status output), ending with the target that failed. */
+function failureConsole(fs: BootFailure[]): string {
+  let out = '';
+  for (const f of fs) {
+    if (!f.unit) out += f.raw + '\n';
+    else if (f.device) {
+      out += `[ TIME ] Timed out waiting for device ${pathUnit(f.device, 'device')} - ${f.device}.\n[DEPEND] Dependency failed for ${f.unit} - ${f.what}.\n`;
+    } else {
+      out += `[FAILED] Failed to ${f.swap ? 'activate swap' : 'mount'} ${f.unit} - ${f.what}.\nSee 'systemctl status ${f.unit}' for details.\n`;
+    }
+  }
+  if (fs.some((f) => !f.swap)) out += '[DEPEND] Dependency failed for local-fs.target - Local File Systems.\n';
+  if (fs.some((f) => f.swap)) out += '[DEPEND] Dependency failed for swap.target - Swaps.\n';
+  return out;
+}
+
+/** The journal lines for failures, as systemd and mount(8) log them. */
+function failureJournal(fs: BootFailure[]): string[] {
+  const out: string[] = [];
+  fs.forEach((f, i) => {
+    if (!f.unit) {
+      out.push(`systemd[1]: ${f.raw}`);
+      return;
+    }
+    if (f.device) {
+      const du = pathUnit(f.device, 'device');
+      out.push(
+        `systemd[1]: ${du}: Job ${du}/start timed out.`,
+        `systemd[1]: Timed out waiting for device ${du} - ${f.device}.`,
+        `systemd[1]: Dependency failed for ${f.unit} - ${f.what}.`,
+        `systemd[1]: ${f.unit}: Job ${f.unit}/start failed with result 'dependency'.`,
+        `systemd[1]: ${du}: Job ${du}/start failed with result 'timeout'.`,
+      );
+      return;
+    }
+    out.push(
+      f.swap ? `systemd[1]: Activating swap ${f.unit} - ${f.what}...` : `systemd[1]: Mounting ${f.unit} - ${f.what}...`,
+      `${f.swap ? 'swapon' : 'mount'}[${612 + i}]: ${f.raw}`,
+      `systemd[1]: ${f.unit}: ${f.swap ? 'Swap' : 'Mount'} process exited, code=exited, status=${f.swap ? '255/EXCEPTION' : '32/n/a'}`,
+      `systemd[1]: ${f.unit}: Failed with result 'exit-code'.`,
+      `systemd[1]: Failed to ${f.swap ? 'activate swap' : 'mount'} ${f.unit} - ${f.what}.`,
+    );
+  });
+  if (fs.some((f) => !f.swap)) {
+    out.push(
+      'systemd[1]: Dependency failed for local-fs.target - Local File Systems.',
+      "systemd[1]: local-fs.target: Job local-fs.target/start failed with result 'dependency'.",
+      'systemd[1]: local-fs.target: Triggering OnFailure= dependencies.',
+    );
+  }
+  if (fs.some((f) => f.swap)) {
+    out.push('systemd[1]: Dependency failed for swap.target - Swaps.', "systemd[1]: swap.target: Job swap.target/start failed with result 'dependency'.");
+  }
+  return out;
+}
+
+/**
+ * How systemd reports fstab or swap failures (mount(8) and swapon(8) messages such as
+ * "mount: /data: can't find UUID=..."): the console status lines and the journal lines.
+ */
+export function bootFailureMessages(messages: string[]): { console: string; journal: string[] } {
+  const fs = messages.map(parseBootFailure);
+  return { console: failureConsole(fs), journal: failureJournal(fs) };
 }
 
 /** Boot the server: GRUB picks an entry, the kernel starts with its arguments, systemd reaches a target. */
@@ -340,15 +474,29 @@ function bootServer(sh: Shell, before = ''): CommandResult {
     out += `(Practice server: the default entry did not boot. You restarted the server and picked "${chosen.title}" in the GRUB menu.)\n\n`;
   }
 
-  // kernel
+  // kernel: new procfs and sysfs first, so nothing left from the last boot can get in the way
+  resetKernelFs(state.root);
   const release = entryRelease(chosen);
   const args = splitArgs(chosen.options);
   k.running = release;
   k.cmdline = cmdlineFor(chosen.linux, chosen.options);
   k.boots++;
   k.bootTime = Date.now() - 6000; // "now" is about six seconds into the boot
-  k.dmesg = bootLog(release, k.cmdline);
+  k.dmesg = bootLog(release, k.cmdline, rootFsUuid(state));
   const journal = [`kernel: ${linuxVersionLine(release)}`, `kernel: Command line: ${k.cmdline}`];
+
+  // systemd: which target the kernel arguments ask for
+  const argWarnings: string[] = [];
+  let target = requestedTarget(args, state.defaultTarget, argWarnings);
+  for (const w of argWarnings) {
+    journal.push(`systemd[1]: ${w}`);
+    kernelLog(state, `systemd[1]: ${w}`, 'warn');
+  }
+  if (!TARGETS[target]) {
+    out += `Unit ${target} not found.\nFalling back to rescue.target.\n`;
+    journal.push(`systemd[1]: Unit ${target} not found.`, 'systemd[1]: Falling back to rescue.target.');
+    target = 'rescue.target';
+  }
 
   // SELinux mode from /etc/selinux/config, unless a kernel argument overrides it
   const conf = state.selinuxConfigMode;
@@ -364,20 +512,19 @@ function bootServer(sh: Shell, before = ''): CommandResult {
 
   bootModules(state, journal);
   bootSysctl(state, journal);
-  const errors = bootSteps.storage(sh);
+  const storage = storageResult(bootSteps.storage(sh));
   syncMountModules(state);
+  const errors = bootFailureMessages(storage.errors);
+  const warnings = bootFailureMessages(storage.warnings);
+  // straight into emergency.target: systemd-remount-fs never runs, so / stays read-only
+  const readOnlyRoot = target === 'emergency.target';
+  remountRoot(state, readOnlyRoot);
 
-  let target = requestedTarget(args, state.defaultTarget);
-  if (!TARGETS[target]) {
-    out += `Failed to load default target: Unit ${target} not found.\nFalling back to rescue.target.\n`;
-    target = 'rescue.target';
-  }
-  if (errors.length) target = 'emergency.target';
+  if (storage.errors.length) target = 'emergency.target';
   k.bootTarget = target;
   k.emergency = target === 'emergency.target';
-  k.bootErrors = errors;
-  for (const e of errors) journal.push(`systemd[1]: ${e.trim()}`);
-  if (errors.length) journal.push('systemd[1]: Dependency failed for local-fs.target - Local File Systems.');
+  k.bootErrors = storage.errors;
+  journal.push(...errors.journal, ...warnings.journal);
   journal.push(`systemd[1]: Reached target ${target} - ${TARGETS[target]}.`);
   appendJournal(state, journal);
 
@@ -388,15 +535,19 @@ function bootServer(sh: Shell, before = ''): CommandResult {
   freshLogin(sh, login);
 
   const notes: string[] = [];
+  for (const w of argWarnings) {
+    const v = /: (\S+)$/.exec(w)?.[1];
+    notes.push(`(Practice note: systemd ignored ${v ? `systemd.unit=${v}` : 'an empty systemd.unit='}, because it needs a whole unit name with its type, such as systemd.unit=rescue.target or systemd.unit=emergency.target.)`);
+  }
   if (args.includes('rd.break')) {
     notes.push('(Practice note: rd.break stops the boot inside the initramfs, with the real root file system on /sysroot. This terminal cannot show that stage, so it booted on. Add rd.break in the GRUB menu (press e) for one boot only; remove it here with: grubby --update-kernel=ALL --remove-args=rd.break)');
   }
   if (args.some((a) => a.startsWith('init='))) {
     notes.push('(Practice note: init=/bin/bash starts a root shell instead of systemd. This terminal cannot show that stage, so it booted on. Add it in the GRUB menu (press e) for one boot only; remove it here with: grubby --update-kernel=ALL --remove-args=init)');
   }
+  out += errors.console + warnings.console;
   const summary = `(Practice server rebooted: kernel ${release}, target ${target}.`;
   if (maintenance) {
-    if (errors.length) out += errors.map((e) => (e.endsWith('\n') ? e : e + '\n')).join('') + '[DEPEND] Dependency failed for local-fs.target - Local File Systems.\n';
     const mode = target === 'rescue.target' ? 'rescue' : 'emergency';
     out += `You are in ${mode} mode. After logging in, type "journalctl -xb" to view\nsystem logs, "systemctl reboot" to reboot, or "exit"\nto continue bootup.\n`;
     if (root.locked || !root.password) {
@@ -405,9 +556,10 @@ function bootServer(sh: Shell, before = ''): CommandResult {
     } else {
       out += 'Give root password for maintenance\n(or press Control-D to continue):\n';
     }
-    out += errors.length
-      ? `${summary} The boot stopped because of the errors above. You are root on the console: fix them (for /etc/fstab, test with "mount -a"), then run "systemctl reboot".)\n`
-      : `${summary} You are root on the console. Run "systemctl reboot" when you are done.)\n`;
+    const ro = readOnlyRoot ? ' / is mounted read-only in emergency mode: run "mount -o remount,rw /" before you change files.' : '';
+    out += storage.errors.length
+      ? `${summary} The boot stopped because of the errors above. You are root on the console:${ro} fix them (for /etc/fstab, test with "mount -a"), then type "exit" to continue the boot, or run "systemctl reboot".)\n`
+      : `${summary} You are root on the console.${ro} Type "exit" (or "systemctl default") to continue to ${state.defaultTarget}, or run "systemctl reboot".)\n`;
   } else {
     out += `${OS_TITLE} ${OS_VERSION}\nKernel ${release} on an x86_64\n\n${summary} You are logged in as ${login.name} again.)\n`;
   }
@@ -436,15 +588,17 @@ const shutdown: Command = (ctx) => {
   if (flags.has('c')) return ok();
   const isReboot = flags.has('r') || flags.has('reboot');
   const when = operands[0] ?? '+1';
-  const m = /^(?:now|\+(\d+)|(\d{1,2}):(\d{2}))$/.exec(when);
+  // systemd's parse_shutdown_time_spec: "now", minutes from now (with or without +), or hh:mm
+  const m = /^(?:now|\+?(\d+)|(\d{1,2}):(\d{2}))$/.exec(when);
   if (!m) return fail(`Failed to parse time specification: ${when}`);
   if (sh.uid !== 0) return fail(isReboot ? REBOOT_DENIED : POWEROFF_DENIED);
   let note = '';
-  if (when !== 'now' && when !== '+0') {
+  if (when !== 'now') {
     const at = new Date();
-    if (m[1]) at.setMinutes(at.getMinutes() + Number(m[1]));
+    if (m[1] !== undefined) at.setMinutes(at.getMinutes() + Number(m[1]));
     else at.setHours(Number(m[2]), Number(m[3]), 0);
-    note = `${isReboot ? 'Reboot' : 'Shutdown'} scheduled for ${systemdDate(at.getTime())}, use 'shutdown -c' to cancel.\n(Practice server: not waiting for it.)\n`;
+    note = `${isReboot ? 'Reboot' : 'Shutdown'} scheduled for ${systemdDate(at.getTime())}, use 'shutdown -c' to cancel.\n`;
+    if (m[1] === undefined || Number(m[1]) > 0) note += '(Practice server: not waiting for it.)\n';
   }
   return isReboot ? bootServer(sh, note) : ok(note + POWEROFF_NOTE);
 };
@@ -854,18 +1008,19 @@ const dracut: Command = ({ sh, args }) => {
 
 const kpath = (e: BootEntry) => bootPath(e.linux);
 
-/** grubby's --args / --remove-args rules: adding key=value first drops any other value of key. */
+/**
+ * grubby-bls update_args: drop the --remove-args (a key=value word, or a key with any value),
+ * then drop every existing value of each key being added, then append all the --args. So
+ * --args="console=tty0 console=ttyS0,115200" keeps both console= arguments.
+ */
 export function updatedOptions(old: string, remove: string[], add: string[]): string {
   let toks = splitArgs(old);
   const drop = (a: string) => {
     toks = toks.filter((t) => (a.includes('=') ? t !== a : t !== a && !t.startsWith(a + '=')));
   };
   remove.forEach(drop);
-  for (const a of add) {
-    drop(a.split('=')[0]);
-    toks.push(a);
-  }
-  return toks.join(' ');
+  for (const a of add) drop(a.split('=')[0]);
+  return [...toks, ...add].join(' ');
 }
 
 const GRUBBY_VALUED = ['info', 'set-default', 'set-default-index', 'update-kernel', 'args', 'remove-args', 'remove-kernel'];
@@ -896,12 +1051,16 @@ const grubby: Command = ({ sh, args }) => {
   if (flags.has('default-index')) return ok(entries[def] ? `${def}\n` : '-1\n');
   if (flags.has('default-title')) return entries[def] ? ok(entries[def].title + '\n') : ok();
 
-  /** grubby-bls param_to_indexes: ALL, DEFAULT, an index or a kernel path. */
+  /**
+   * grubby-bls param_to_indexes: ALL, DEFAULT, an index, TITLE=<title>, or a kernel path. Only the
+   * file name of a path counts, so /boot/vmlinuz-X, /vmlinuz-X and vmlinuz-X are the same kernel.
+   */
   const indexes = (param: string): number[] => {
     if (param === 'ALL') return entries.map((_, i) => i);
     if (param === 'DEFAULT') return entries[def] ? [def] : [];
     if (/^\d+$/.test(param)) return Number(param) < entries.length ? [Number(param)] : [];
-    return entries.flatMap((e, i) => (kpath(e) === param || e.linux === param ? [i] : []));
+    const file = '/' + param.split('/').pop();
+    return entries.flatMap((e, i) => (e.linux === param || e.linux === file || param === `TITLE=${e.title}` ? [i] : []));
   };
   const incorrect = (param: string) => fail(`The param ${param} is incorrect`);
 
@@ -949,13 +1108,14 @@ const grubby: Command = ({ sh, args }) => {
       entries[i].options = updatedOptions(entries[i].options, remove, add);
       writeEntry(state, entries[i]);
     }
-    // like grubby-bls, ALL also changes GRUB_CMDLINE_LINUX so new kernels and grub2-mkconfig keep it
+    // like grubby-bls, ALL also changes GRUB_CMDLINE_LINUX so new kernels and grub2-mkconfig keep it:
+    // it sources the file (the last line wins) and rewrites every GRUB_CMDLINE_LINUX= line with sed
     const grubDefault = textAt(state.root, '/etc/default/grub');
     if (param === 'ALL' && !flags.has('no-etc-grub-update') && grubDefault !== null && (add.length || remove.length)) {
       const old = readSettings(grubDefault).GRUB_CMDLINE_LINUX;
-      if (old) {
+      if (old !== undefined) {
         const line = `GRUB_CMDLINE_LINUX="${updatedOptions(old, remove, add)}"`;
-        putFile(state.root, '/etc/default/grub', grubDefault.replace(/^GRUB_CMDLINE_LINUX=.*$/m, () => line));
+        putFile(state.root, '/etc/default/grub', grubDefault.replace(/^GRUB_CMDLINE_LINUX=.*$/gm, () => line));
       }
     }
     return ok();
@@ -1071,11 +1231,66 @@ const grub2Editenv: Command = ({ sh, args }) => {
 };
 
 // ---------- dnf and rpm ----------
+// RHEL 10 ships dnf 4 (dnf-4.20), not dnf5, so this is dnf 4 output. The dnf* helpers are exported
+// so that the dnf for other packages can print the same way.
 
-const DNF_ROOT = 'Error: This command has to be run with superuser privileges (under the root user on most systems).';
-const DNF_HEAD = 'Updating and loading repositories:\nRepositories loaded.\n';
+/** dnf run by a normal user, on a system registered with subscription-manager. */
+export const DNF_ROOT =
+  'Not root, Subscription Management repositories not updated\nError: This command has to be run with superuser privileges (under the root user on most systems).';
+
+/**
+ * What dnf 4 prints first: the subscription-manager plugin, then (for commands that read the
+ * repositories, which dnf remove does not) the age of the cached metadata. dnf-makecache.timer
+ * refreshes it 10 minutes after boot and then every hour.
+ */
+export function dnfHead(sh: Shell, repos = true): string {
+  const plugin = sh.uid === 0 ? 'Updating Subscription Management repositories.\n' : 'Not root, Subscription Management repositories not updated\n';
+  if (!repos) return plugin;
+  const now = Date.now();
+  const up = Math.max(0, now - sh.state.kernel.bootTime);
+  const ago = up < 600000 ? up + 1460000 : (up - 600000) % 3600000;
+  const s = Math.floor(ago / 1000);
+  return `${plugin}Last metadata expiration check: ${Math.floor(s / 3600)}:${p2(Math.floor(s / 60) % 60)}:${p2(s % 60)} ago on ${rpmDate(now - ago)}.\n`;
+}
+
+export const DNF_NOTHING = 'Dependencies resolved.\nNothing to do.\nComplete!\n';
+/** dnf 4 when no package matches a name (strict=True: nothing is installed). */
+export const dnfNoMatch = (p: string) => `No match for argument: ${p}\nError: Unable to find a match: ${p}\n`;
+
+/** One row of a transaction table: name, version-release, repository, size. */
+export type DnfRow = [string, string, string, string];
+
+/**
+ * dnf 4's transaction: the package table, the summary and the transaction steps, up to
+ * "Running transaction". `sections` are headings like "Installing:" with their rows.
+ */
+export function dnfTransaction(sections: [string, DnfRow[]][], summary: [string, number][], sizes: string[]): string {
+  const rows = sections.flatMap(([, r]) => r);
+  const head: DnfRow = ['Package', 'Version', 'Repository', 'Size'];
+  const w = head.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));
+  const line = (r: DnfRow, arch: string) => ` ${r[0].padEnd(w[0])}  ${arch.padEnd(6)}  ${r[1].padEnd(w[1])}  ${r[2].padEnd(w[2])}  ${r[3].padStart(w[3])}\n`;
+  const rule = '='.repeat(w[0] + w[1] + w[2] + w[3] + 15) + '\n';
+  let out = `Dependencies resolved.\n${rule}${line(head, 'Arch')}${rule}`;
+  for (const [title, r] of sections) if (r.length) out += title + '\n' + r.map((x) => line(x, 'x86_64')).join('');
+  out += `\nTransaction Summary\n${rule}`;
+  for (const [verb, n] of summary) if (n) out += `${verb.padEnd(8)} ${n} Package${n === 1 ? '' : 's'}\n`;
+  out += '\n' + sizes.map((s) => s + '\n').join('');
+  return out + 'Running transaction check\nTransaction check succeeded.\nRunning transaction test\nTransaction test succeeded.\nRunning transaction\n';
+}
+
+/** dnf 4's closing lists after a transaction ("Installed:", "Removed:") and "Complete!". */
+export const dnfDone = (lists: [string, string[]][]) =>
+  '\n' + lists.filter(([, l]) => l.length).map(([t, l]) => `${t}\n${l.map((p) => `  ${p}\n`).join('')}`).join('') + '\nComplete!\n';
+
 const BASEOS = 'rhel-10-for-x86_64-baseos-rpms';
-const SUBPACKAGES: [string, string][] = [['kernel', '0.0   B'], ['kernel-core', '79.6 MiB'], ['kernel-modules', '40.2 MiB'], ['kernel-modules-core', '31.7 MiB']];
+/** The kernel packages of one release: name, download size, installed size, summary, description. */
+const SUBPACKAGES: [string, string, string, string, string][] = [
+  ['kernel', '1.6 M', '0  ', 'The Linux kernel', 'The kernel meta package'],
+  ['kernel-core', '18 M', '68 M', 'The Linux kernel', 'The kernel package contains the Linux kernel (vmlinuz), the core of any Linux operating system.'],
+  ['kernel-modules', '38 M', '40 M', 'kernel modules to match the core kernel', 'This package provides commonly used kernel modules for the core kernel package.'],
+  ['kernel-modules-core', '33 M', '32 M', 'Core kernel modules to match the core kernel', 'This package provides essential kernel modules for the core kernel package.'],
+];
+const SUBPACKAGE_NAMES = SUBPACKAGES.map(([p]) => p);
 const KERNEL_PKG = /^kernel(?:-(core|modules|modules-core))?(?:-(\d[\w.]*-\d[\w.]*?))?(?:\.x86_64)?$/;
 
 /** "kernel-core-6.12.0-124.el10" -> { pkg: "kernel-core", release: "6.12.0-124.el10.x86_64" }. */
@@ -1086,38 +1301,34 @@ export function parseKernelPkg(name: string): { pkg: string; release: string | n
 }
 
 const newestRepoKernel = () => [...REPO_KERNELS].sort(verCmp).pop()!;
-const repoOf = (release: string) => (release === RUNNING_KERNEL ? 'anaconda' : BASEOS);
+/** The repository an installed kernel came from (dnf shows it with @): the installer, BaseOS or unknown. */
+const repoOf = (release: string) => (release === RUNNING_KERNEL ? 'anaconda' : REPO_KERNELS.includes(release) ? BASEOS : 'System');
+const nvras = (release: string) => SUBPACKAGE_NAMES.map((p) => `${p}-${release}`);
 
-function dnfTable(install: string[], remove: string[]): string {
-  const row = (pkg: string, rel: string, repo: string, size: string) =>
-    ` ${pkg.padEnd(20)} x86_64 ${pkgVersion(rel).padEnd(16)} ${repo.padEnd(32)} ${size.padStart(9)}\n`;
-  let out = `${'Package'.padEnd(21)} ${'Arch'.padEnd(6)} ${'Version'.padEnd(16)} ${'Repository'.padEnd(32)} ${'Size'.padStart(9)}\n`;
-  for (const r of install) {
-    out += 'Installing:\n' + row('kernel', r, BASEOS, '0.0   B') + 'Installing dependencies:\n';
-    for (const [p, size] of SUBPACKAGES.slice(1)) out += row(p, r, BASEOS, size);
+/** Why a kernel request cannot run at all (a version no repository has, the running kernel), or null. */
+function kernelDnfProblem(sh: Shell, verb: 'install' | 'remove', pkgs: string[]): CommandResult | null {
+  const k = sh.state.kernel;
+  if (verb === 'install') {
+    const bad = pkgs.find((p) => {
+      const r = parseKernelPkg(p)!.release;
+      return r && !REPO_KERNELS.includes(r);
+    });
+    return bad ? result('', dnfNoMatch(bad), 1) : null;
   }
-  if (remove.length) {
-    out += 'Removing:\n';
-    for (const r of remove) for (const [p, size] of SUBPACKAGES) out += row(p, r, '@System', size);
+  const releases = kernelRemoveSet(sh, pkgs).releases;
+  if (releases.includes(k.running)) {
+    return result('', `Error: \n Problem: The operation would result in removing of running kernel: kernel-core-${k.running}\n`, 1);
   }
-  out += '\nTransaction Summary:\n';
-  if (install.length) out += ` Installing:        ${install.length * 4} packages\n`;
-  if (remove.length) out += ` Removing:          ${remove.length * 4} packages\n`;
-  return out + '\nRunning transaction\n';
+  return null;
 }
 
+/** dnf install/upgrade of kernel packages (output without dnfHead). Kernels are installed next to the old ones. */
 function dnfInstall(sh: Shell, pkgs: string[], upgrade: boolean): CommandResult {
   const k = sh.state.kernel;
   let release = newestRepoKernel();
-  for (const p of pkgs) {
-    const parsed = parseKernelPkg(p)!;
-    if (parsed.release && !REPO_KERNELS.includes(parsed.release)) {
-      return fail(`${DNF_HEAD}Failed to resolve the transaction:\nNo match for argument: ${p}\nYou can try to add to command line:\n  --skip-unavailable to skip unavailable packages`);
-    }
-    if (parsed.release) release = parsed.release;
-  }
+  for (const p of pkgs) release = parseKernelPkg(p)!.release ?? release;
   if (k.installed.includes(release)) {
-    return ok(DNF_HEAD + (upgrade ? '' : `Package "kernel-${release}" is already installed.\n\n`) + 'Nothing to do.\n');
+    return ok((upgrade ? '' : `Package kernel-${release} is already installed.\n`) + DNF_NOTHING);
   }
   installKernel(sh.state, release);
   // installonly_limit: drop the lowest versions, never the running kernel or the new one
@@ -1131,59 +1342,112 @@ function dnfInstall(sh: Shell, pkgs: string[], upgrade: boolean): CommandResult 
       removed.push(old);
     }
   }
+  // dnf upgrade lists every installonly package as installed; dnf install pulls the rest in as dependencies
+  const asked = upgrade ? SUBPACKAGE_NAMES : [...new Set(pkgs.map((p) => parseKernelPkg(p)!.pkg))];
+  const row = (p: string, r: string, repo: string, size: string): DnfRow => [p, pkgVersion(r), repo, size];
+  const table = dnfTransaction(
+    [
+      ['Installing:', SUBPACKAGES.filter(([p]) => asked.includes(p)).map(([p, dl]) => row(p, release, BASEOS, dl))],
+      ['Installing dependencies:', SUBPACKAGES.filter(([p]) => !asked.includes(p)).map(([p, dl]) => row(p, release, BASEOS, dl))],
+      ['Removing:', removed.flatMap((r) => SUBPACKAGES.map(([p, , inst]) => row(p, r, '@' + repoOf(r), inst)))],
+    ],
+    [['Install', 4], ['Remove', removed.length * 4]],
+    ['Total download size: 91 M', 'Installed size: 140 M'],
+  );
   return ok(
-    DNF_HEAD + dnfTable([release], removed) + 'Complete!\n' +
+    table + dnfDone([['Installed:', nvras(release)], ['Removed:', removed.flatMap(nvras)]]) +
       `(The new kernel is installed next to the old one${removed.length ? ` and the oldest kernel was removed (installonly_limit=${limit})` : ''}. It is the default boot entry now, but "uname -r" shows ${k.running} until you reboot.)\n`,
   );
 }
 
-function dnfRemove(sh: Shell, pkgs: string[]): CommandResult {
+/** Which installed kernels a dnf remove means, and the arguments that match none. */
+function kernelRemoveSet(sh: Shell, pkgs: string[]): { releases: string[]; missing: string[] } {
   const k = sh.state.kernel;
   const releases = new Set<string>();
+  const missing: string[] = [];
   for (const p of pkgs) {
     const parsed = parseKernelPkg(p)!;
-    if (parsed.release && !k.installed.includes(parsed.release)) return fail(`No packages to remove for argument: ${p}`);
-    for (const r of parsed.release ? [parsed.release] : k.installed) releases.add(r);
+    if (parsed.release && !k.installed.includes(parsed.release)) missing.push(p);
+    else for (const r of parsed.release ? [parsed.release] : k.installed) releases.add(r);
   }
-  if (releases.has(k.running)) {
-    return fail(`Failed to resolve the transaction:\nProblem: The operation would result in removing of running kernel: kernel-core-${k.running}`);
-  }
-  for (const r of releases) removeKernel(sh.state, r);
-  return ok(dnfTable([], [...releases]) + 'Complete!\n');
+  return { releases: [...releases], missing };
 }
+
+/** dnf remove of kernel packages (output without dnfHead). */
+function dnfRemove(sh: Shell, pkgs: string[]): CommandResult {
+  const problem = kernelDnfProblem(sh, 'remove', pkgs);
+  if (problem) return problem;
+  const { releases, missing } = kernelRemoveSet(sh, pkgs);
+  let out = missing.map((p) => `No match for argument: ${p}\n`).join('');
+  if (!releases.length) return ok(out + 'No packages marked for removal.\n' + DNF_NOTHING);
+  for (const r of releases) removeKernel(sh.state, r);
+  const asked = [...new Set(pkgs.map((p) => parseKernelPkg(p)!.pkg))];
+  const rows = (keep: (p: string) => boolean) =>
+    releases.flatMap((r) => SUBPACKAGES.filter(([p]) => keep(p)).map(([p, , inst]): DnfRow => [p, pkgVersion(r), '@' + repoOf(r), inst]));
+  out += dnfTransaction(
+    [
+      ['Removing:', rows((p) => asked.includes(p))],
+      [asked.includes('kernel') ? 'Removing unused dependencies:' : 'Removing dependent packages:', rows((p) => !asked.includes(p))],
+    ],
+    [['Remove', releases.length * 4]],
+    [`Freed space: ${releases.length * 140} M`],
+  );
+  return ok(out + dnfDone([['Removed:', releases.flatMap(nvras)]]));
+}
+
+/** The kernel package names that dnf arguments such as kernel, kernel-core or kernel* mean. */
+const kernelNames = (pkgs: string[]) =>
+  [...new Set(pkgs.flatMap((p) => (p.endsWith('*') ? SUBPACKAGE_NAMES.filter((s) => s.startsWith(parseKernelPkg(p)!.pkg)) : [parseKernelPkg(p)!.pkg])))];
 
 function dnfList(sh: Shell, pkgs: string[], opts: { installed: boolean; available: boolean; all: boolean }): CommandResult {
   const k = sh.state.kernel;
-  const names = [...new Set(pkgs.map((p) => (p.endsWith('*') ? SUBPACKAGES.map(([s]) => s) : [parseKernelPkg(p)!.pkg])).flat())];
-  const line = (pkg: string, rel: string, repo: string) => `${(pkg + '.x86_64').padEnd(28)} ${pkgVersion(rel).padEnd(16)} ${repo}\n`;
-  let out = DNF_HEAD;
-  if (!opts.available) {
-    out += 'Installed packages\n';
-    for (const n of names) for (const r of k.installed) out += line(n, r, repoOf(r));
+  const names = kernelNames(pkgs);
+  const line = (pkg: string, rel: string, repo: string) => `${(pkg + '.x86_64').padEnd(34)} ${pkgVersion(rel).padEnd(22)} ${repo}\n`;
+  let out = '';
+  if (!opts.available && k.installed.length) {
+    out += 'Installed Packages\n';
+    for (const n of names) for (const r of k.installed) out += line(n, r, '@' + repoOf(r));
   }
   const newest = [...k.installed].sort(verCmp).pop() ?? '';
-  const avail = REPO_KERNELS.filter((r) => opts.all || verCmp(r, newest) > 0);
+  // --showduplicates: every version the repository has that is not installed; otherwise only a newer one
+  const avail = REPO_KERNELS.filter((r) => (opts.all ? !k.installed.includes(r) : verCmp(r, newest) > 0));
   if (!opts.installed && avail.length) {
-    out += (opts.available ? '' : '\n') + 'Available packages\n';
+    out += 'Available Packages\n';
     for (const n of names) for (const r of avail) out += line(n, r, BASEOS);
   }
-  return ok(out);
+  return out ? ok(dnfHead(sh) + out) : fail(dnfHead(sh) + 'Error: No matching Packages to list');
 }
 
-function dnfInfo(sh: Shell): CommandResult {
+function dnfInfo(sh: Shell, pkgs: string[]): CommandResult {
   const k = sh.state.kernel;
-  const block = (r: string, repo: string) =>
-    `Name            : kernel\nEpoch           : 0\nVersion         : ${r.split('-')[0]}\nRelease         : ${pkgVersion(r).split('-')[1]}\nArchitecture    : x86_64\n${repo === BASEOS && !k.installed.includes(r) ? 'Download size   : 0.0   B\nRepository      ' : 'From repository '}: ${repo}\nSummary         : The Linux kernel\nURL             : https://www.kernel.org/\nLicense         : GPL-2.0-only\nDescription     : The kernel meta package\n`;
-  let out = DNF_HEAD + 'Installed packages\n' + k.installed.map((r) => block(r, repoOf(r))).join('\n');
+  const names = kernelNames(pkgs);
+  const block = (name: string, r: string, installed: boolean) => {
+    const [, dl, inst, summary, desc] = SUBPACKAGES.find(([p]) => p === name)!;
+    const f = (key: string, v: string) => `${key.padEnd(12)} : ${v}\n`;
+    return (
+      f('Name', name) + f('Version', r.split('-')[0]) + f('Release', pkgVersion(r).split('-')[1]) + f('Architecture', 'x86_64') +
+      f('Size', installed ? inst.replace(/^0 +$/, '0.0  ') : dl) + f('Source', `kernel-${pkgVersion(r)}.src.rpm`) +
+      (installed ? f('Repository', '@System') + f('From repo', repoOf(r)) : f('Repository', BASEOS)) +
+      f('Summary', summary) + f('URL', 'https://www.kernel.org/') + f('License', 'GPL-2.0-only') +
+      f('Description', desc)
+    );
+  };
+  let out = dnfHead(sh) + 'Installed Packages\n' + names.flatMap((n) => k.installed.map((r) => block(n, r, true))).join('\n');
   const newest = newestRepoKernel();
-  if (!k.installed.includes(newest)) out += '\nAvailable packages\n' + block(newest, BASEOS);
+  if (!k.installed.includes(newest)) out += '\nAvailable Packages\n' + names.map((n) => block(n, newest, false)).join('\n');
   return ok(out);
 }
 
-/** dnf requests that concern kernel packages (install/update kernel). Returns null to let dnf handle it. */
+let inBaseDnf = false; // set while kernelDnf runs the normal dnf for the other packages
+
+/**
+ * dnf requests that concern kernel packages (install/update kernel). Returns null to let dnf
+ * handle it. When kernel and other packages are mixed, the other packages go to the normal dnf.
+ */
 export function kernelDnf(ctx: CommandContext): CommandResult | null {
   const { sh, args } = ctx;
-  const words: string[] = [];
+  if (inBaseDnf) return null;
+  const words: number[] = []; // indexes of the words that are not options
   let excludeKernel = false;
   const opts = { installed: false, available: false, all: false };
   for (let i = 0; i < args.length; i++) {
@@ -1195,35 +1459,69 @@ export function kernelDnf(ctx: CommandContext): CommandResult | null {
     else if (a === '--showduplicates') opts.all = true;
     else if (a === '--installed') opts.installed = true;
     else if (a === '--available') opts.available = true;
-    else if (!a.startsWith('-')) words.push(a);
+    else if (!a.startsWith('-')) words.push(i);
   }
-  const [verb, ...rest] = words;
-  if (verb === 'list' && ['installed', 'available'].includes(rest[0] ?? '')) opts[rest.shift() as 'installed' | 'available'] = true;
-  const pkgs = rest;
-  const onlyKernel = pkgs.length > 0 && pkgs.every((p) => parseKernelPkg(p));
+  const verb = args[words[0]];
+  let pkgIdx = words.slice(1);
+  if (verb === 'list' && ['installed', 'available'].includes(args[pkgIdx[0]] ?? '')) {
+    opts[args[pkgIdx[0]] as 'installed' | 'available'] = true;
+    pkgIdx = pkgIdx.slice(1);
+  }
+  const pkgs = pkgIdx.map((i) => args[i]);
+  const kernelIdx = pkgIdx.filter((i) => parseKernelPkg(args[i]));
+  const kernelPkgs = kernelIdx.map((i) => args[i]);
+  const onlyKernel = pkgs.length > 0 && kernelPkgs.length === pkgs.length;
+  const mixed = kernelPkgs.length > 0 && !onlyKernel;
   const k = sh.state.kernel;
+
+  /** Run the kernel part, after the normal dnf has done the other packages (its answer goes first). */
+  const withOthers = (verb: 'install' | 'remove', run: () => CommandResult): CommandResult => {
+    const head = dnfHead(sh, verb === 'install');
+    // on failure the whole answer goes to stderr, so that the terminal shows it in order
+    const headed = (r: CommandResult) => (r.code ? fail(head + r.stdout + r.stderr, r.code) : { ...r, stdout: head + r.stdout });
+    if (!mixed) return headed(run());
+    // dnf does all or nothing: check the kernel part before the other packages change
+    const problem = kernelDnfProblem(sh, verb, kernelPkgs);
+    if (problem) return headed(problem);
+    inBaseDnf = true;
+    let base: CommandResult;
+    try {
+      base = sh.exec(['dnf', ...args.filter((_, i) => !kernelIdx.includes(i))]);
+    } finally {
+      inBaseDnf = false;
+    }
+    if (base.code !== 0) return base;
+    const own = [dnfHead(sh, verb === 'install'), dnfHead(sh, false), 'Updating and loading repositories:\nRepositories loaded.\n'];
+    const rest = own.reduce((s, h) => (s.startsWith(h) ? s.slice(h.length) : s), base.stdout);
+    const r = run();
+    return result(head + rest + r.stdout, base.stderr + r.stderr, r.code);
+  };
+
   switch (verb) {
     case 'install':
-      if (!onlyKernel) return null;
-      return sh.uid !== 0 ? fail(DNF_ROOT) : dnfInstall(sh, pkgs, false);
+      if (!kernelPkgs.length) return null;
+      if (sh.uid !== 0) return fail(DNF_ROOT);
+      return withOthers('install', () => kernelDnfProblem(sh, 'install', kernelPkgs) ?? dnfInstall(sh, kernelPkgs, false));
     case 'update':
     case 'upgrade':
-      if ((pkgs.length && !onlyKernel) || excludeKernel) return null;
+      if (excludeKernel || (pkgs.length && !kernelPkgs.length)) return null;
       if (!pkgs.length && k.installed.includes(newestRepoKernel())) return null;
-      return sh.uid !== 0 ? fail(DNF_ROOT) : dnfInstall(sh, pkgs, true);
+      if (sh.uid !== 0) return fail(DNF_ROOT);
+      return withOthers('install', () => kernelDnfProblem(sh, 'install', kernelPkgs) ?? dnfInstall(sh, kernelPkgs, true));
     case 'remove':
     case 'erase':
-      if (!onlyKernel) return null;
-      return sh.uid !== 0 ? fail(DNF_ROOT) : dnfRemove(sh, pkgs);
+      if (!kernelPkgs.length) return null;
+      if (sh.uid !== 0) return fail(DNF_ROOT);
+      return withOthers('remove', () => dnfRemove(sh, kernelPkgs));
     case 'list':
       return onlyKernel ? dnfList(sh, pkgs, opts) : null;
     case 'info':
-      return onlyKernel ? dnfInfo(sh) : null;
+      return onlyKernel ? dnfInfo(sh, pkgs) : null;
     case 'check-update':
     case 'check-upgrade': {
       const newest = newestRepoKernel();
-      if (k.installed.includes(newest) || excludeKernel) return ok(DNF_HEAD);
-      return result(DNF_HEAD + SUBPACKAGES.map(([p]) => `${(p + '.x86_64').padEnd(28)} ${pkgVersion(newest).padEnd(16)} ${BASEOS}\n`).join(''), '', 100);
+      if (k.installed.includes(newest) || excludeKernel) return ok(dnfHead(sh));
+      return result(dnfHead(sh) + '\n' + SUBPACKAGE_NAMES.map((p) => `${(p + '.x86_64').padEnd(34)} ${pkgVersion(newest).padEnd(22)} ${BASEOS}\n`).join(''), '', 100);
     }
     default:
       return null;
@@ -1237,7 +1535,17 @@ function rpmFiles(pkg: string, r: string): string[] {
   return Object.values(MODULES).filter((m) => !!m.boot === core).map((m) => `/lib/modules/${r}/${m.path}`);
 }
 
-let inRpmQa = false; // set while kernelRpm runs the normal rpm -qa
+let inBaseRpm = false; // set while kernelRpm runs the normal rpm
+
+/** Run the normal rpm, for packages other than the kernel. */
+function baseRpm(sh: Shell, args: string[]): CommandResult {
+  inBaseRpm = true;
+  try {
+    return sh.exec(['rpm', ...args]);
+  } finally {
+    inBaseRpm = false;
+  }
+}
 
 const RPM_FLAGS: Record<string, string> = { q: 'query', a: 'all', i: 'info', l: 'list', f: 'file' };
 
@@ -1252,32 +1560,80 @@ function kernelFileOwner(installed: string[], path: string): string | null {
   return mod ? `${mod.boot ? 'kernel-modules-core' : 'kernel-modules'}-${lib[1]}` : null;
 }
 
-/** rpm queries for kernel packages (rpm -q kernel). Returns null to let rpm handle it. */
+/** An installed package as rpm queries see it. `release` is the kernel release for kernel packages. */
+interface RpmPkg {
+  name: string;
+  version: string;
+  release: string;
+  arch: string;
+  time: number; // install time (ms)
+  kernel: string | null;
+}
+
+const nvra = (p: RpmPkg) => `${p.name}-${p.version}-${p.release}.${p.arch}`;
+
+function kernelPkg(k: SystemState['kernel'], name: string, r: string): RpmPkg {
+  return { name, version: r.split('-')[0], release: pkgVersion(r).split('-')[1], arch: 'x86_64', time: k.installedAt[r] ?? Date.now(), kernel: r };
+}
+
+/** "bash-5.2.26-6.el10.x86_64" from the normal rpm, as a package; null for other lines. */
+function parseNvra(line: string, time: number): RpmPkg | null {
+  const m = /^(.+)-([^-]+)-([^-]+)\.([^.\s]+)$/.exec(line.trim());
+  return m ? { name: m[1], version: m[2], release: m[3], arch: m[4], time, kernel: null } : null;
+}
+
+/** rpm --queryformat: %{TAG}, %-20{TAG}, %{INSTALLTIME:date} and backslash escapes. null for an unknown tag. */
+function rpmQueryFormat(fmt: string, p: RpmPkg): string | null {
+  const summary = SUBPACKAGES.find(([n]) => n === p.name)?.[3] ?? AVAILABLE_PACKAGES[pkgKey(p.name)]?.summary ?? '(none)';
+  const tags: Record<string, string> = {
+    NAME: p.name, VERSION: p.version, RELEASE: p.release, ARCH: p.arch, EPOCH: '(none)', SUMMARY: summary,
+    NVR: `${p.name}-${p.version}-${p.release}`, NVRA: nvra(p), NEVRA: nvra(p), NEVR: `${p.name}-${p.version}-${p.release}`,
+    INSTALLTIME: String(Math.floor(p.time / 1000)), VENDOR: 'Red Hat, Inc.', LICENSE: p.kernel ? 'GPL-2.0-only' : '(none)',
+    SOURCERPM: p.kernel ? `kernel-${p.version}-${p.release}.src.rpm` : `${p.name}-${p.version}-${p.release}.src.rpm`,
+  };
+  let bad = false;
+  const text = fmt.replace(/%(-?\d*)\{(\w+)(?::(\w+))?\}/g, (_m, width: string, tag: string, conv: string | undefined) => {
+    let v = tags[tag.toUpperCase()];
+    if (v === undefined) {
+      bad = true;
+      return '';
+    }
+    if (conv === 'date' && /TIME$/i.test(tag)) v = rpmDate(Number(v) * 1000);
+    const n = Math.abs(Number(width) || 0);
+    return width.startsWith('-') ? v.padEnd(n) : v.padStart(n);
+  });
+  if (bad) return null;
+  const esc: Record<string, string> = { n: '\n', t: '\t', r: '\r', a: '\x07', '\\': '\\', '"': '"' };
+  return text.replace(/\\(.)/g, (m, c: string) => esc[c] ?? m);
+}
+
+/** rpm's glob match for -qa PATTERN: against the name, or the name with version and release. */
+function rpmMatch(p: RpmPkg, globs: string[]): boolean {
+  if (!globs.length) return true;
+  const re = (g: string) => new RegExp('^' + g.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+  const forms = [p.name, `${p.name}-${p.version}`, `${p.name}-${p.version}-${p.release}`, nvra(p)];
+  return globs.some((g) => forms.some((f) => re(g).test(f)));
+}
+
+/** rpm queries for kernel packages (rpm -q kernel, rpm -qa). Returns null to let rpm handle it. */
 export function kernelRpm(ctx: CommandContext): CommandResult | null {
   const { sh, args } = ctx;
+  if (inBaseRpm) return null;
   const f = new Set<string>();
   const ops: string[] = [];
-  for (const a of args) {
-    if (['--last', '--query', '--all', '--info', '--list', '--file'].includes(a)) f.add(a.slice(2));
+  let qf: string | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    const eq = /^--(?:qf|queryformat)=([\s\S]*)$/.exec(a);
+    if (eq) qf = eq[1];
+    else if (a === '--qf' || a === '--queryformat') qf = args[++i] ?? '';
+    else if (['--last', '--query', '--all', '--info', '--list', '--file'].includes(a)) f.add(a.slice(2));
     else if (a.startsWith('--')) return null;
-    else if (a.startsWith('-')) for (const ch of a.slice(1)) f.add(RPM_FLAGS[ch] ?? ch);
+    else if (a.startsWith('-') && a.length > 1) for (const ch of a.slice(1)) f.add(RPM_FLAGS[ch] ?? ch);
     else ops.push(a);
   }
   if (!f.has('query')) return null;
   const k = sh.state.kernel;
-  if (!ops.length) {
-    if (!f.has('all') || f.size > 2 || inRpmQa) return null;
-    // rpm -qa: the normal list, plus the kernel packages
-    inRpmQa = true;
-    try {
-      const base = sh.exec(['rpm', ...args]);
-      if (base.code !== 0) return base;
-      const kernels = k.installed.flatMap((r) => ['kernel-core', 'kernel-modules-core', 'kernel-modules', 'kernel'].map((p) => `${p}-${r}\n`));
-      return { ...base, stdout: base.stdout + kernels.join('') };
-    } finally {
-      inRpmQa = false;
-    }
-  }
 
   if (f.has('file')) {
     if (!ops.every((p) => /^\/(boot|(usr\/)?lib\/modules)\//.test(p))) return null;
@@ -1291,30 +1647,53 @@ export function kernelRpm(ctx: CommandContext): CommandResult | null {
     return result(out, '', code);
   }
 
-  const parsed = ops.map((o) => [o, parseKernelPkg(o)] as const);
-  if (parsed.some(([, p]) => !p)) return null;
-  const rows: [string, string][] = []; // [package name, release]
-  let err = '';
-  for (const [op, p] of parsed) {
-    const pkgs = f.has('all') && op.endsWith('*') ? SUBPACKAGES.map(([s]) => s).filter((s) => s.startsWith(p!.pkg)) : [p!.pkg];
-    const rels = p!.release ? [p!.release] : k.installed;
-    if (p!.release && !k.installed.includes(p!.release)) {
-      if (!f.has('all')) err += `package ${op} is not installed\n`;
-      continue;
-    }
-    for (const r of rels) for (const pkg of pkgs) rows.push([pkg, r]);
+  const kernels = k.installed.flatMap((r) => ['kernel-core', 'kernel-modules-core', 'kernel-modules', 'kernel'].map((n) => kernelPkg(k, n, r)));
+  const systemTime = k.installedAt[RUNNING_KERNEL] ?? k.bootTime - 86400000; // when the other packages came
+  let pkgs: (RpmPkg | string)[]; // a string is a line of the normal rpm's answer, such as "package x is not installed"
+
+  if (f.has('all')) {
+    // rpm -qa [PATTERN...]: the normal list plus the kernel packages
+    const base = baseRpm(sh, ['-qa']);
+    if (base.code !== 0) return base;
+    const others = base.stdout.split('\n').filter(Boolean).map((l) => parseNvra(l, systemTime) ?? l);
+    pkgs = [...others, ...kernels].filter((p) => typeof p !== 'string' && rpmMatch(p, ops));
+    if ((f.has('info') || f.has('list')) && pkgs.some((p) => typeof p !== 'string' && !p.kernel)) return null;
+  } else {
+    if (!ops.length) return null;
+    if (!ops.some((o) => parseKernelPkg(o)) && qf === null) return null;
+    if ((f.has('info') || f.has('list')) && !ops.every((o) => parseKernelPkg(o))) return null;
+    pkgs = ops.flatMap((op): (RpmPkg | string)[] => {
+      const p = parseKernelPkg(op);
+      if (!p) {
+        const line = baseRpm(sh, ['-q', op]).stdout.split('\n')[0] ?? '';
+        return [(!line.startsWith('package ') && parseNvra(line, systemTime)) || line];
+      }
+      if (p.release && !k.installed.includes(p.release)) return [`package ${op} is not installed`];
+      return (p.release ? [p.release] : k.installed).map((r) => kernelPkg(k, p.pkg, r));
+    });
   }
-  if (f.has('last')) rows.sort((a, b) => (k.installedAt[b[1]] ?? 0) - (k.installedAt[a[1]] ?? 0));
+
+  if (f.has('last')) {
+    pkgs = pkgs.map((p, i) => ({ p, i })).sort((a, b) => (typeof b.p === 'string' ? 0 : b.p.time) - (typeof a.p === 'string' ? 0 : a.p.time) || a.i - b.i).map((x) => x.p);
+  }
   let out = '';
-  for (const [pkg, r] of rows) {
-    const full = `${pkg}-${r}`;
-    if (f.has('info')) {
-      out += `Name        : ${pkg}\nVersion     : ${r.split('-')[0]}\nRelease     : ${pkgVersion(r).split('-')[1]}\nArchitecture: x86_64\nInstall Date: ${rpmDate(k.installedAt[r] ?? Date.now())}\nGroup       : Unspecified\nLicense     : GPL-2.0-only\nSource RPM  : kernel-${pkgVersion(r)}.src.rpm\nVendor      : Red Hat, Inc.\nURL         : https://www.kernel.org/\nSummary     : The Linux kernel${pkg === 'kernel' ? '' : pkg === 'kernel-core' ? ' (core part)' : ' modules'}\n`;
-    } else if (f.has('list')) out += rpmFiles(pkg, r).join('\n') + '\n';
-    else if (f.has('last')) out += `${full.padEnd(45)} ${rpmDate(k.installedAt[r] ?? Date.now())}\n`;
-    else out += full + '\n';
+  let code = 0;
+  for (const p of pkgs) {
+    if (typeof p === 'string') {
+      out += p + '\n';
+      code = 1;
+    } else if (qf !== null) {
+      const s = rpmQueryFormat(qf, p);
+      if (s === null) return fail('error: incorrect format: unknown tag');
+      out += s;
+    } else if (f.has('info')) {
+      const summary = SUBPACKAGES.find(([n]) => n === p.name)?.[3] ?? '';
+      out += `Name        : ${p.name}\nVersion     : ${p.version}\nRelease     : ${p.release}\nArchitecture: x86_64\nInstall Date: ${rpmDate(p.time)}\nGroup       : Unspecified\nLicense     : GPL-2.0-only\nSource RPM  : kernel-${p.version}-${p.release}.src.rpm\nVendor      : Red Hat, Inc.\nURL         : https://www.kernel.org/\nSummary     : ${summary}\n`;
+    } else if (f.has('list')) out += rpmFiles(p.name, p.kernel!).join('\n') + '\n';
+    else if (f.has('last')) out += `${nvra(p).padEnd(45)} ${rpmDate(p.time)}\n`;
+    else out += nvra(p) + '\n';
   }
-  return result(out, err, err ? 1 : 0);
+  return result(out, '', code);
 }
 
 // ---------- exports ----------
