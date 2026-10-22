@@ -1,3 +1,6 @@
+import { R16_BOOT_LABS, R17_LABS, R18_LABS } from './labs-kernel';
+import { R19_LABS } from './labs-script';
+import { R14_LABS, R15_LABS } from './labs-storage';
 import { Module, groupOf, inGroup, peek, permBits, ran, userByName } from './types';
 
 // RHCSA track: R1 and R13–R26. Original practice material mapped to the EX200 objectives.
@@ -216,7 +219,7 @@ export const R14: Module = {
     { front: 'findmnt --verify', back: 'Check /etc/fstab for mistakes.' },
     { front: 'xfs_admin -L / e2label', back: 'Change the label of an XFS / ext4 file system.' },
   ],
-  labs: [],
+  labs: R14_LABS,
 };
 
 export const R15: Module = {
@@ -275,7 +278,7 @@ export const R15: Module = {
     { front: '/dev/vg/lv and /dev/mapper/vg-lv', back: 'Two names for the same LV. Either works in fstab.' },
     { front: 'pvs / vgs / lvs', back: 'Short overview. *display commands give detail.' },
   ],
-  labs: [],
+  labs: R15_LABS,
 };
 
 export const R16: Module = {
@@ -355,6 +358,7 @@ export const R16: Module = {
         },
       ],
     },
+    ...R16_BOOT_LABS,
   ],
 };
 
@@ -413,7 +417,7 @@ export const R17: Module = {
     { front: '/proc and /sys', back: 'Virtual file systems with kernel, process and device information.' },
     { front: 'dmesg', back: 'Kernel ring buffer: hardware and driver messages.' },
   ],
-  labs: [],
+  labs: R17_LABS,
 };
 
 export const R18: Module = {
@@ -470,7 +474,7 @@ export const R18: Module = {
     { front: 'Boot an older kernel', back: 'Pick it in the GRUB menu if a new kernel fails.' },
     { front: 'journalctl -xb', back: 'All messages of this boot, with extra explanation where available. Add -p err for errors only.' },
   ],
-  labs: [],
+  labs: R18_LABS,
 };
 
 export const R19: Module = {
@@ -530,7 +534,7 @@ export const R19: Module = {
     { front: 'exit 1', back: 'Stop the script with an error code.' },
     { front: 'read NAME', back: 'Ask for input and store it in NAME.' },
   ],
-  labs: [],
+  labs: R19_LABS,
 };
 
 export const R20: Module = {

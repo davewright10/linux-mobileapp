@@ -15,9 +15,19 @@ import {
   splitPath,
 } from './fs';
 import { ADMIN_COMMANDS } from './commands-admin';
+import { FIND_COMMANDS } from './commands-find';
+import { KERNEL_COMMANDS, kernelDnf, kernelRpm, rebootSystem } from './commands-kernel';
+import { SCRIPT_COMMANDS } from './commands-script';
+import { STORAGE_COMMANDS } from './commands-storage';
+import { RegexSyntaxError, TEXT_COMMANDS, posixRegex } from './commands-text';
+import { journalctl, journaldStart, mountUnit } from './journal';
+import { machineId, nodeAt } from './kernel-state';
 import { MAN_PAGES } from './manpages';
+import { cEscape } from './parser';
 import type { Shell } from './shell';
-import { AVAILABLE_PACKAGES, Group, User, pkgKey, pkgName } from './state';
+import { AVAILABLE_PACKAGES, Group, User, pkgKey, pkgName, runningHostname } from './state';
+import { fstabCheck } from './storage-state';
+import { SudoCommand, checkSudoersText, readSudoers, securePath, sudoCheck, sudoList } from './sudoers';
 
 export interface CommandResult {
   stdout: string;
@@ -31,6 +41,8 @@ export interface CommandContext {
   args: string[];
   stdin: string;
   name: string;
+  /** Standard output is the terminal (not a pipe, a file or $( )). Unset counts as the terminal. */
+  tty?: boolean;
 }
 
 type Command = (ctx: CommandContext) => CommandResult;
@@ -133,9 +145,13 @@ const cd: Command = ({ sh, args }) => {
   }
 };
 
-const ls: Command = ({ sh, args }) => {
-  const { flags, operands } = getopts(args);
+const ls: Command = ({ sh, args, tty }) => {
+  // -1 is an option of ls (getopts reads -5 as a number, for head and tail)
+  const { flags, operands } = getopts(args.filter((a) => a !== '-1'));
+  if (args.includes('-1')) flags.add('1');
   const long = flags.has('l');
+  // GNU ls prints columns on a terminal and one name per line into a pipe or file (-1 and -C choose)
+  const sep = flags.has('1') || (tty === false && !flags.has('C')) ? '\n' : '  ';
   const all = flags.has('a');
   const almost = flags.has('A');
   const dirOnly = flags.has('d');
@@ -170,14 +186,22 @@ const ls: Command = ({ sh, args }) => {
     if (sortTime) names.sort((a, b) => node.children![b].mtime - node.children![a].mtime);
     if (reverse) names.reverse();
     const entries: [string, FsNode][] = names.map((n) => [n, node.children![n]]);
-    if (all) entries.unshift(['.', node], ['..', node]);
+    if (all) {
+      let parent = node;
+      try {
+        parent = sh.resolve(path === '/' ? '/' : `${path.replace(/\/+$/, '')}/..`).node;
+      } catch {
+        // no access to the parent: show the directory itself, as before
+      }
+      entries.unshift(['.', node], ['..', parent]);
+    }
     if (header) out += `${path}:\n`;
     if (long) {
       const total = entries.reduce((s, [, n]) => s + Math.ceil(nodeSize(n) / 1024) * 4, 0);
       out += `total ${total}\n`;
       out += entries.map(([n, c]) => line(n, c)).join('\n') + (entries.length ? '\n' : '');
     } else if (entries.length) {
-      out += entries.map(([n, c]) => line(n, c)).join('  ') + '\n';
+      out += entries.map(([n, c]) => line(n, c)).join(sep) + '\n';
     }
     if (recursive) {
       for (const [n, c] of entries) {
@@ -201,7 +225,7 @@ const ls: Command = ({ sh, args }) => {
       code = 2;
     }
   }
-  if (files.length) out += files.join(long ? '\n' : '  ') + '\n';
+  if (files.length) out += files.join(long ? '\n' : sep) + '\n';
   dirs.forEach(([p, n], i) => {
     if (i > 0 || files.length) out += '\n';
     listDir(p, n, targets.length > 1 || recursive);
@@ -295,18 +319,39 @@ const cat: Command = ({ sh, args, stdin }) => {
 const echo: Command = ({ args }) => {
   let newline = true;
   let escapes = false;
-  let rest = args;
-  while (rest[0] === '-n' || rest[0] === '-e') {
-    if (rest[0] === '-n') newline = false;
-    else escapes = true;
-    rest = rest.slice(1);
+  let k = 0;
+  // bash's echo: every leading word made of n, e and E letters is options (-n, -e, -ne, -eE)
+  for (; k < args.length && /^-[neE]+$/.test(args[k]); k++) {
+    for (const c of args[k].slice(1)) {
+      if (c === 'n') newline = false;
+      else escapes = c === 'e';
+    }
   }
-  let s = rest.join(' ');
-  if (escapes) s = s.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-  return ok(s + (newline ? '\n' : ''));
+  const s = args.slice(k).join(' ');
+  if (!escapes) return ok(s + (newline ? '\n' : ''));
+  let r = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i + 1];
+    if (s[i] !== '\\' || c === undefined) r += s[i];
+    else if (c === 'c') return ok(r); // \c: nothing more, not even the newline
+    else if (c === "'" || c === '"' || c === '?') r += '\\';
+    else {
+      // \n \t \\ \a \e, \0NNN octal, \xHH, \uHHHH; anything else stays as typed
+      const [text, used] = cEscape(s, i + 1, true);
+      r += text;
+      i += used;
+    }
+  }
+  return ok(r + (newline ? '\n' : ''));
 };
 
-function copyInto(sh: Shell, src: string, dest: string, recursive: boolean, move: boolean): string | null {
+/**
+ * Copy (or with move, rename) src to dest, or into dest when it is a directory. Like GNU cp, a new
+ * copy belongs to the user and gets the source mode minus the umask (and minus setuid/setgid on
+ * files); an existing file keeps its owner and mode. preserve (-p, -a) keeps mode, times and,
+ * for root, the owner.
+ */
+function copyInto(sh: Shell, src: string, dest: string, recursive: boolean, move: boolean, preserve = false): string | null {
   let s;
   try {
     s = sh.resolve(src, !move);
@@ -325,17 +370,29 @@ function copyInto(sh: Shell, src: string, dest: string, recursive: boolean, move
       dir.children![name] = s.node;
     } else {
       const existing = dir.children![name];
+      const attrs = (n: FsNode, from: FsNode) => {
+        if (preserve) {
+          n.mode = from.mode;
+          n.mtime = from.mtime;
+          n.uid = sh.uid === 0 ? from.uid : sh.uid;
+          n.gid = sh.uid === 0 || sh.gids.includes(from.gid) ? from.gid : sh.user.gid;
+        }
+      };
       if (existing && existing.type === 'file' && s.node.type === 'file') {
         existing.content = s.node.content;
         existing.mtime = Date.now();
+        attrs(existing, s.node);
       } else {
         const copy = cloneNode(s.node);
-        const setOwner = (n: FsNode) => {
+        const setOwner = (n: FsNode, from: FsNode) => {
           n.uid = sh.uid;
           n.gid = sh.user.gid;
-          n.children && Object.values(n.children).forEach(setOwner);
+          if (n.type === 'file') n.mode = from.mode & 0o777 & ~sh.umask;
+          else if (n.type === 'dir') n.mode = from.mode & 0o7777 & ~sh.umask;
+          attrs(n, from);
+          if (n.children) for (const [k, c] of Object.entries(n.children)) setOwner(c, from.children![k]);
         };
-        setOwner(copy);
+        setOwner(copy, s.node);
         dir.children![name] = copy;
       }
     }
@@ -350,11 +407,12 @@ const cp: Command = ({ sh, args }) => {
   if (operands.length < 2) return fail(`cp: missing destination file operand after '${operands[0] ?? ''}'`);
   const dest = operands.pop()!;
   const recursive = flags.has('r') || flags.has('R') || flags.has('a');
+  const preserve = flags.has('p') || flags.has('a') || flags.has('archive');
   if (operands.length > 1 && !(sh.exists(dest) && sh.resolve(dest).node.type === 'dir'))
     return fail(`cp: target '${dest}': Not a directory`);
   let err = '';
   for (const s of operands) {
-    const e = copyInto(sh, s, dest, recursive, false);
+    const e = copyInto(sh, s, dest, recursive, false, preserve);
     if (e) err += `cp: ${e}\n`;
   }
   return err ? fail(err) : ok();
@@ -464,60 +522,6 @@ const file: Command = ({ sh, args }) => {
   return ok(out);
 };
 
-const find: Command = ({ sh, args }) => {
-  let start = '.';
-  let i = 0;
-  if (args[0] && !args[0].startsWith('-')) {
-    start = args[0];
-    i = 1;
-  }
-  let nameRe: RegExp | null = null;
-  let type: string | null = null;
-  let user: string | null = null;
-  let perm: string | null = null;
-  for (; i < args.length; i++) {
-    const a = args[i];
-    const v = args[++i] ?? '';
-    if (a === '-name' || a === '-iname') {
-      const src = '^' + v.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$';
-      nameRe = new RegExp(src, a === '-iname' ? 'i' : '');
-    } else if (a === '-type') type = v;
-    else if (a === '-user') user = v;
-    else if (a === '-perm') perm = v;
-    else return fail(`find: unknown predicate '${a}'`);
-  }
-  let out = '';
-  let err = '';
-  const visit = (path: string, node: FsNode, name: string) => {
-    const t = node.type === 'dir' ? 'd' : node.type === 'link' ? 'l' : 'f';
-    let match = true;
-    if (nameRe && !nameRe.test(name)) match = false;
-    if (type && type !== t) match = false;
-    if (user && userName(sh, node.uid) !== user) match = false;
-    if (perm) {
-      const want = parseInt(perm.replace(/^[-/]/, ''), 8);
-      if (perm.startsWith('-') || perm.startsWith('/')) {
-        if (perm.startsWith('-') ? (node.mode & want) !== want : (node.mode & want) === 0) match = false;
-      } else if ((node.mode & 0o7777) !== want) match = false;
-    }
-    if (match) out += path + '\n';
-    if (node.type === 'dir') {
-      if (!canAccess(node, 'r', sh.uid, sh.gids) || !canAccess(node, 'x', sh.uid, sh.gids)) {
-        err += `find: '${path}': Permission denied\n`;
-        return;
-      }
-      for (const [n, c] of Object.entries(node.children!).sort()) visit(`${path === '/' ? '' : path}/${n}`, c, n);
-    }
-  };
-  try {
-    const r = sh.resolve(start);
-    visit(start, r.node, r.name);
-  } catch (e) {
-    return fail(`find: '${start}': ${e instanceof FsError ? errorText[e.reason] : e}`);
-  }
-  return { stdout: out, stderr: err, code: err ? 1 : 0 };
-};
-
 // ---------- text tools ----------
 
 function inputText(sh: Shell, operands: string[], stdin: string, cmd: string): { text: string; err: string } {
@@ -566,15 +570,6 @@ const wc: Command = ({ sh, args, stdin }) => {
   return { stdout: parts.join(' ') + name + '\n', stderr: err, code: err ? 1 : 0 };
 };
 
-function toJsRegex(pattern: string, extended: boolean): string {
-  if (extended) return pattern;
-  // basic regex: \| \+ \? \( \) are special, bare ones are literal
-  return pattern
-    .replace(/\\([|+?(){}])/g, '\u0000$1')
-    .replace(/([|+?(){}])/g, '\\$1')
-    .replace(/\u0000([|+?(){}])/g, '$1');
-}
-
 const grep: Command = ({ sh, args, stdin, name }) => {
   const { flags, values, operands } = getopts(args, ['e']);
   const pattern = values.e ?? operands.shift();
@@ -582,9 +577,10 @@ const grep: Command = ({ sh, args, stdin, name }) => {
   const extended = flags.has('E') || name === 'egrep';
   let re: RegExp;
   try {
-    re = new RegExp(flags.has('w') ? `\\b(?:${toJsRegex(pattern, extended)})\\b` : toJsRegex(pattern, extended), flags.has('i') ? 'i' : '');
-  } catch {
-    return fail('grep: Invalid regular expression', 2);
+    const src = flags.has('F') ? pattern.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&') : posixRegex(pattern, extended);
+    re = new RegExp(flags.has('w') ? `\\b(?:${src})\\b` : src, flags.has('i') ? 'i' : '');
+  } catch (e) {
+    return fail(`grep: ${e instanceof RegexSyntaxError ? e.message : 'Invalid regular expression'}`, 2);
   }
   const invert = flags.has('v');
   let out = '';
@@ -693,74 +689,6 @@ const cut: Command = ({ sh, args, stdin }) => {
   return { stdout: joinLines(out), stderr: err, code: err ? 1 : 0 };
 };
 
-const tr: Command = ({ args, stdin }) => {
-  const { flags, operands } = getopts(args);
-  const expand = (s: string) =>
-    s
-      .replace('[:lower:]', 'a-z')
-      .replace('[:upper:]', 'A-Z')
-      .replace(/(.)-(.)/g, (_, a: string, b: string) => {
-        let r = '';
-        for (let c = a.charCodeAt(0); c <= b.charCodeAt(0); c++) r += String.fromCharCode(c);
-        return r;
-      });
-  const from = expand(operands[0] ?? '');
-  if (flags.has('d')) return ok([...stdin].filter((c) => !from.includes(c)).join(''));
-  const to = expand(operands[1] ?? '');
-  return ok([...stdin].map((c) => (from.includes(c) ? to[Math.min(from.indexOf(c), to.length - 1)] ?? c : c)).join(''));
-};
-
-const awk: Command = ({ sh, args, stdin }) => {
-  // Supports the common teaching forms: awk -F: '{ print $1, $3 }' and '/re/ { print $1 }'
-  const { values, operands } = getopts(args, ['F']);
-  const prog = operands.shift() ?? '';
-  const { text } = inputText(sh, operands, stdin, 'awk');
-  const m = /^\s*(?:\/(.*)\/)?\s*(?:\{\s*print\s*(.*?)\s*\})?\s*$/.exec(prog);
-  if (!m) return fail("awk: this practice terminal supports patterns like '/text/ { print $1, $3 }'", 2);
-  const re = m[1] ? new RegExp(m[1]) : null;
-  const fieldsExpr = m[2] ?? '$0';
-  const out: string[] = [];
-  for (const l of lines(text)) {
-    if (re && !re.test(l)) continue;
-    const f = values.F ? l.split(values.F) : l.trim().split(/\s+/);
-    const parts = fieldsExpr.split(',').map((e) => {
-      const t = e.trim();
-      if (t === '$0' || t === '') return l;
-      if (t === 'NF') return String(f.length);
-      if (t === '$NF') return f[f.length - 1] ?? '';
-      const fm = /^\$(\d+)$/.exec(t);
-      if (fm) return f[parseInt(fm[1], 10) - 1] ?? '';
-      return t.replace(/^"|"$/g, '');
-    });
-    out.push(parts.join(' '));
-  }
-  return ok(joinLines(out));
-};
-
-const sed: Command = ({ sh, args, stdin }) => {
-  const { flags, operands } = getopts(args);
-  const script = operands.shift() ?? '';
-  const m = /^s(.)(.*?)\1(.*?)\1(g?)$/.exec(script);
-  const del = /^(?:\/(.*)\/|(\d+))d$/.exec(script);
-  if (!m && !del) return fail("sed: this practice terminal supports 's/old/new/g' and '/pattern/d'");
-  const transform = (text: string) =>
-    joinLines(
-      lines(text).flatMap((l, i) => {
-        if (del) {
-          const hit = del[1] !== undefined ? new RegExp(del[1]).test(l) : i + 1 === parseInt(del[2], 10);
-          return hit ? [] : [l];
-        }
-        return [l.replace(new RegExp(m![2], m![4] ? 'g' : ''), m![3])];
-      }),
-    );
-  if (flags.has('i')) {
-    for (const p of operands) sh.writeFile(p, transform(sh.readFile(p)));
-    return ok();
-  }
-  const { text } = inputText(sh, operands, stdin, 'sed');
-  return ok(transform(text));
-};
-
 const tee: Command = ({ sh, args, stdin }) => {
   const { flags, operands } = getopts(args);
   for (const p of operands) sh.writeFile(p, stdin, flags.has('a'));
@@ -858,22 +786,22 @@ function findGroup(sh: Shell, name: string): Group | undefined {
 
 const id: Command = ({ sh, args }) => {
   const { flags, operands } = getopts(args);
-  const u = operands[0] ? findUser(sh, operands[0]) : sh.user;
+  const u = operands.length ? findUser(sh, operands[0]) : sh.user;
   if (!u) return fail(`id: '${operands[0]}': no such user`);
   const primary = findGroup(sh, String(u.gid));
   const groups = [primary!, ...sh.state.groups.filter((g) => g.members.includes(u.name) && g.gid !== u.gid)];
   if (flags.has('u')) return ok(`${flags.has('n') ? u.name : u.uid}\n`);
   if (flags.has('g')) return ok(`${flags.has('n') ? primary?.name : u.gid}\n`);
   if (flags.has('G')) return ok(groups.map((g) => (flags.has('n') ? g.name : g.gid)).join(' ') + '\n');
-  const ctx = operands[0] ? '' : ' context=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023';
+  const ctx = operands.length ? '' : ' context=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023';
   return ok(`uid=${u.uid}(${u.name}) gid=${u.gid}(${primary?.name}) groups=${groups.map((g) => `${g.gid}(${g.name})`).join(',')}${ctx}\n`);
 };
 
 const groupsCmd: Command = ({ sh, args }) => {
-  const u = args[0] ? findUser(sh, args[0]) : sh.user;
+  const u = args.length ? findUser(sh, args[0]) : sh.user;
   if (!u) return fail(`groups: '${args[0]}': no such user`);
   const names = [findGroup(sh, String(u.gid))?.name, ...sh.state.groups.filter((g) => g.members.includes(u.name)).map((g) => g.name)];
-  return ok(`${args[0] ? u.name + ' : ' : ''}${[...new Set(names)].join(' ')}\n`);
+  return ok(`${args.length ? u.name + ' : ' : ''}${[...new Set(names)].join(' ')}\n`);
 };
 
 const useradd: Command = ({ sh, args }) => {
@@ -1157,31 +1085,354 @@ const umask: Command = ({ sh, args }) => {
   return ok();
 };
 
-const sudo: Command = ({ sh, args, stdin }) => {
-  const isWheel = sh.state.groups.find((g) => g.name === 'wheel')?.members.includes(sh.user.name);
-  if (sh.uid !== 0 && !isWheel) {
-    return fail(`${sh.user.name} is not in the sudoers file.  This incident will be reported.`);
+// ---------- sudo and su ----------
+
+const SUDO_USAGE = `usage: sudo -h | -K | -k | -V
+usage: sudo -v [-ABkNnS] [-g group] [-h host] [-p prompt] [-u user]
+usage: sudo -l [-ABkNnS] [-g group] [-h host] [-p prompt] [-U user]
+            [-u user] [command [arg ...]]
+usage: sudo [-ABbEHkNnPS] [-r role] [-t type] [-C num] [-D directory]
+            [-g group] [-h host] [-p prompt] [-R directory] [-T timeout]
+            [-u user] [VAR=value] [-i | -s] [command [arg ...]]
+usage: sudo -e [-ABkNnS] [-r role] [-t type] [-C num] [-D directory]
+            [-g group] [-h host] [-p prompt] [-R directory] [-T timeout]
+            [-u user] file ...`;
+
+const SUDO_HELP = `sudo - execute a command as another user
+
+${SUDO_USAGE}
+
+Options:
+  -E, --preserve-env            preserve user environment when running command
+  -i, --login                   run login shell as the target user; a command
+                                may also be specified
+  -k, --reset-timestamp         invalidate timestamp file
+  -l, --list                    list user's privileges or check a specific
+                                command; use twice for longer format
+  -n, --non-interactive         non-interactive mode, no prompts are used
+  -s, --shell                   run shell as the target user; a command may
+                                also be specified
+  -U, --other-user=user         in list mode, display privileges for user
+  -u, --user=user               run command (or edit file) as specified user
+                                name or ID
+  -V, --version                 display version information and exit
+  -v, --validate                update user's timestamp without running a
+                                command
+  --                            stop processing command line arguments
+`;
+
+const STD_BIN_DIRS = ['/bin', '/sbin', '/usr/bin', '/usr/sbin'];
+const PRACTICE_BIN = /^\/(usr\/)?s?bin\/[^/]+$/;
+
+/**
+ * Run fn as `user` in `cwd`, the way sudo and su start a command: in a session of its own, with
+ * PATH set to `path` (null: the user's login default). The caller's directory never changes.
+ */
+function runAs<T>(sh: Shell, user: User, cwd: string, path: string | null | undefined, vars: [string, string][], fn: () => T): T {
+  const sessions = sh.sessions;
+  const session = { user, cwd };
+  sessions.push(session);
+  const env = sh.env;
+  const saved = new Map<string, string | undefined>();
+  const set = (k: string, v: string | null) => {
+    if (!saved.has(k)) saved.set(k, Object.prototype.hasOwnProperty.call(env, k) ? env[k] : undefined);
+    if (v === null) delete env[k];
+    else env[k] = v;
+  };
+  if (path !== undefined) set('PATH', path);
+  for (const [k, v] of vars) set(k, v);
+  try {
+    return fn();
+  } finally {
+    // a reboot starts new sessions and a new environment: then there is nothing to put back
+    if (sh.env === env) {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete env[k];
+        else env[k] = v;
+      }
+    }
+    // "sudo bash" or "sudo su -" leave their own shell on top: only this session goes
+    if (sh.sessions === sessions) {
+      const i = sessions.lastIndexOf(session);
+      if (i > 0) sessions.splice(i, 1);
+    }
   }
-  const root = findUser(sh, 'root')!;
-  if (args[0] === '-i' || args[0] === '-s' || (args[0] === 'su' && (args[1] === '-' || !args[1]))) {
-    sh.sessions.push({ user: root, cwd: args[0] === '-s' ? sh.cwd : '/root' });
-    return ok();
+}
+
+/** Find a command the way sudo does: through secure_path, never through shell functions or aliases. */
+function sudoFind(sh: Shell, name: string, path: string): { argv0: string; cmd: SudoCommand } | null {
+  if (name.includes('/')) {
+    const abs = joinPath(splitPath(sh.cwd, name, sh.user.home));
+    const node = nodeAt(sh.state.root, abs);
+    if (node) return { argv0: name, cmd: { path: abs, args: [], practice: false } };
+    const base = abs.split('/').pop()!;
+    if (COMMANDS[base] && PRACTICE_BIN.test(abs)) return { argv0: name, cmd: { path: abs, args: [], practice: true } };
+    return null;
   }
-  if (!args.length) return fail('usage: sudo -i | sudo command');
-  return sh.asUser(root, () => sh.exec(args, stdin));
+  for (const d of path.split(':')) {
+    if (!d) continue;
+    const dir = d.replace(/(.)\/+$/, '$1');
+    // the practice commands have no files and count as being in /usr/bin and /usr/sbin
+    if (Object.prototype.hasOwnProperty.call(COMMANDS, name) && STD_BIN_DIRS.includes(dir)) {
+      return { argv0: name, cmd: { path: `/usr/bin/${name}`, args: [], practice: true } };
+    }
+    const full = `${dir}/${name}`;
+    const node = nodeAt(sh.state.root, full);
+    if (node?.type === 'file' && node.mode & 0o111) return { argv0: full, cmd: { path: full, args: [], practice: false } };
+  }
+  return null;
+}
+
+const sudo: Command = (ctx) => {
+  const { sh, args, stdin } = ctx;
+  let runUser: string | null = null;
+  let listUser: string | null = null;
+  let mode: 'run' | 'login' | 'shell' | 'list' | 'validate' | 'edit' = 'run';
+  let reset = false;
+  let i = 0;
+  const bad = (msg: string) => fail(`sudo: ${msg}\n${SUDO_USAGE}`);
+  for (; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') {
+      i++;
+      break;
+    }
+    if (a.startsWith('--')) {
+      const [k, v] = a.slice(2).split(/=(.*)/s, 2);
+      let val: string | undefined;
+      if (['user', 'other-user', 'group', 'prompt', 'close-from', 'role', 'type', 'chdir', 'chroot', 'command-timeout'].includes(k)) {
+        val = v ?? args[++i];
+        if (val === undefined) return bad(`option '--${k}' requires an argument`);
+      }
+      if (k === 'user') runUser = val!;
+      else if (k === 'other-user') listUser = val!;
+      else if (k === 'chdir' || k === 'chroot') return fail(`sudo: you are not permitted to use the --${k} option`);
+      else if (k === 'login') mode = 'login';
+      else if (k === 'shell') mode = 'shell';
+      else if (k === 'list') mode = 'list';
+      else if (k === 'validate') mode = 'validate';
+      else if (k === 'edit') mode = 'edit';
+      else if (k === 'help') return ok(SUDO_HELP);
+      else if (k === 'version') return ok('Sudo version 1.9.15p5\n');
+      else if (k === 'reset-timestamp' || k === 'remove-timestamp') reset = true;
+      else if (val === undefined && !['preserve-env', 'set-home', 'non-interactive', 'background', 'stdin', 'askpass', 'bell', 'preserve-groups'].includes(k)) {
+        return bad(`unrecognized option '${a}'`);
+      }
+      continue;
+    }
+    if (!a.startsWith('-') || a === '-') break;
+    for (let j = 1; j < a.length; j++) {
+      const c = a[j];
+      if ('ugUpCDrtTR'.includes(c)) {
+        const v = a.slice(j + 1) || args[++i];
+        if (v === undefined) return bad(`option requires an argument -- '${c}'`);
+        if (c === 'u') runUser = v;
+        if (c === 'U') listUser = v;
+        if (c === 'D' || c === 'R') return fail(`sudo: you are not permitted to use the -${c} option`);
+        break;
+      }
+      if (c === 'i') mode = 'login';
+      else if (c === 's') mode = 'shell';
+      else if (c === 'l') mode = 'list';
+      else if (c === 'v') mode = 'validate';
+      else if (c === 'e') mode = 'edit';
+      else if (c === 'h') return ok(SUDO_HELP);
+      else if (c === 'V') return ok('Sudo version 1.9.15p5\n');
+      else if (c === 'k' || c === 'K') reset = true;
+      else if (!'AbBEHnNPS'.includes(c)) return bad(`invalid option -- '${c}'`);
+    }
+  }
+  const vars: [string, string][] = [];
+  while (i < args.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(args[i])) {
+    const eq = args[i].indexOf('=');
+    vars.push([args[i].slice(0, eq), args[i].slice(eq + 1)]);
+    i++;
+  }
+  const rest = args.slice(i);
+  if (mode === 'edit') return editor({ ...ctx, name: 'sudoedit' });
+  if (mode === 'run' && !rest.length) return reset ? ok() : fail(SUDO_USAGE);
+
+  const st = sh.state;
+  const sud = readSudoers(st);
+  const warn = sud.warnings.map((w) => w + '\n').join('');
+  if (sud.errors.length) {
+    return fail(
+      `${warn}${sud.errors[0]}\nsudo: error initializing audit plugin sudoers_audit\n(Practice server: a broken sudoers file locks everyone out of sudo. On a real server you would repair it with "pkexec visudo" or from rescue mode. Here, tap Reset to start again. Next time, check a rule with "visudo -c -f FILE" before you install it.)`,
+    );
+  }
+  const host = runningHostname(st);
+  const short = host.split('.')[0];
+  const caller = sh.user;
+  const target = runUser === null ? findUser(sh, 'root')! : findUser(sh, runUser.replace(/^#/, ''));
+  if (!target) return fail(`${warn}sudo: unknown user ${runUser}\nsudo: error initializing audit plugin sudoers_audit`);
+  const secure = securePath(st, sud, caller) ?? sh.getVar('PATH');
+  const notInSudoers = () => fail(`${warn}${caller.name} is not in the sudoers file.  This incident will be reported.`);
+
+  if (mode === 'list') {
+    let who = caller;
+    if (listUser !== null) {
+      const u = findUser(sh, listUser);
+      if (!u) return fail(`${warn}sudo: unknown user ${listUser}`);
+      const shell = { path: '/usr/bin/bash', args: [], practice: false };
+      if (caller.uid !== 0 && sudoCheck(st, sud, caller, findUser(sh, 'root')!, shell, host) !== 'allowed') {
+        return fail(`${warn}Sorry, user ${caller.name} is not allowed to execute 'list' as ${u.name} on ${short}.`);
+      }
+      who = u;
+    }
+    if (rest.length) {
+      const found = sudoFind(sh, rest[0], securePath(st, sud, who) ?? sh.getVar('PATH'));
+      if (!found) return fail(`${warn}sudo: ${rest[0]}: command not found`);
+      const cmd = { ...found.cmd, args: rest.slice(1) };
+      if (sudoCheck(st, sud, who, target, cmd, host) !== 'allowed') return { stdout: '', stderr: warn, code: 1 };
+      return { stdout: [cmd.path, ...cmd.args].join(' ') + '\n', stderr: warn, code: 0 };
+    }
+    const list = sudoList(st, sud, who, host);
+    if (!list) {
+      return listUser !== null
+        ? { stdout: `User ${who.name} is not allowed to run sudo on ${short}.\n`, stderr: warn, code: 1 }
+        : fail(`${warn}Sorry, user ${who.name} may not run sudo on ${short}.`);
+    }
+    const defaults = list.defaults ? `Matching Defaults entries for ${who.name} on ${short}:\n    ${list.defaults}\n\n` : '';
+    return { stdout: `${defaults}User ${who.name} may run the following commands on ${short}:\n${list.rules.map((r) => `    ${r}\n`).join('')}`, stderr: warn, code: 0 };
+  }
+  if (mode === 'validate' || (reset && !rest.length)) {
+    return sudoList(st, sud, caller, host) ? { stdout: '', stderr: warn, code: 0 } : notInSudoers();
+  }
+
+  // what sudo runs: the command, or the target's shell for -i and -s
+  const shellMode = mode === 'login' || mode === 'shell';
+  let cmd: SudoCommand;
+  let argv0 = '';
+  if (shellMode) {
+    cmd = { path: usrPath(target.shell), args: rest.length ? ['-c', rest.join(' ')] : [], practice: false };
+  } else {
+    const found = sudoFind(sh, rest[0], secure);
+    if (!found) {
+      if (!sudoList(st, sud, caller, host)) return notInSudoers();
+      return fail(`${warn}sudo: ${rest[0]}: command not found`);
+    }
+    argv0 = found.argv0;
+    cmd = { ...found.cmd, args: rest.slice(1) };
+  }
+  const verdict = sudoCheck(st, sud, caller, target, cmd, host);
+  if (verdict === 'not-in-sudoers') return notInSudoers();
+  if (verdict === 'denied') {
+    return fail(`${warn}Sorry, user ${caller.name} is not allowed to execute '${[cmd.path, ...cmd.args].join(' ')}' as ${target.name} on ${host}.`);
+  }
+  const prefix = (r: CommandResult): CommandResult => (warn ? { ...r, stderr: warn + r.stderr } : r);
+  if (shellMode) {
+    if (target.shell.endsWith('nologin')) return prefix({ stdout: 'This account is currently not available.\n', stderr: '', code: 1 });
+    const cwd = mode === 'login' ? target.home : sh.cwd;
+    if (!rest.length) {
+      // an interactive shell: it stays until "exit"
+      sh.sessions.push({ user: target, cwd });
+      return prefix(ok());
+    }
+    const name0 = mode === 'login' ? '-bash' : 'bash';
+    return prefix(runAs(sh, target, cwd, mode === 'login' ? null : secure, vars, () => sh.runString(rest.join(' '), name0, [], stdin)));
+  }
+  return prefix(runAs(sh, target, sh.cwd, secure, vars, () => sh.exec([argv0, ...rest.slice(1)], stdin)));
 };
 
-const su: Command = ({ sh, args }) => {
-  const login = args.includes('-') || args.includes('-l');
-  const name = args.filter((a) => a !== '-' && a !== '-l')[0] ?? 'root';
-  const u = findUser(sh, name);
-  if (!u) return fail(`su: user ${name} does not exist or the user entry does not contain all the required fields`);
-  if (u.shell.endsWith('nologin')) return ok('This account is currently not available.\n');
-  if (sh.uid !== 0 && name === 'root') {
-    return fail('su: Authentication failure\n(The practice root password is not set. Use sudo -i instead, which is how RHEL admins usually become root.)');
+/** /bin/bash is /usr/bin/bash on RHEL. */
+const usrPath = (p: string) => p.replace(/^\/bin\//, '/usr/bin/').replace(/^\/sbin\//, '/usr/sbin/');
+
+const SU_HELP = `
+Usage:
+ su [options] [-] [<user> [<argument>...]]
+
+Change the effective user ID and group ID to that of <user>.
+A mere - implies -l.  If <user> is not given, root is assumed.
+
+Options:
+ -m, -p, --preserve-environment      do not reset environment variables
+ -c, --command <command>             pass a single command to the shell with -c
+ -l, --login                         make the shell a login shell
+ -s, --shell <shell>                 run <shell> if /etc/shells allows it
+`;
+
+const su: Command = ({ sh, args, stdin }) => {
+  let login = false;
+  let command: string | null = null;
+  let shellOpt: string | null = null;
+  let name: string | null = null;
+  const extra: string[] = [];
+  const usage = "\nTry 'su --help' for more information.";
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (name !== null && !a.startsWith('-')) {
+      extra.push(a);
+      continue;
+    }
+    if (a === '-' || a === '-l' || a === '--login') login = true;
+    else if (a === '-c' || a === '--command' || a === '-s' || a === '--shell') {
+      const v = args[++i];
+      if (v === undefined) return fail(a.startsWith('--') ? `su: option '${a}' requires an argument${usage}` : `su: option requires an argument -- '${a[1]}'${usage}`);
+      if (a.includes('c')) command = v;
+      else shellOpt = v;
+    } else if (a.startsWith('--command=')) command = a.slice('--command='.length);
+    else if (a.startsWith('--shell=')) shellOpt = a.slice('--shell='.length);
+    else if (a === '-m' || a === '-p' || a === '--preserve-environment') continue;
+    else if (a === '-h' || a === '--help') return ok(SU_HELP);
+    else if (/^-[lmp]+$/.test(a)) login ||= a.includes('l');
+    else if (/^-[lmp]*c./.test(a)) {
+      login ||= a.slice(0, a.indexOf('c')).includes('l');
+      command = a.slice(a.indexOf('c') + 1);
+    } else if (/^-[lmp]*c$/.test(a)) {
+      login ||= a.includes('l');
+      command = args[++i] ?? null;
+      if (command === null) return fail(`su: option requires an argument -- 'c'${usage}`);
+    } else if (a.startsWith('--')) return fail(`su: unrecognized option '${a}'${usage}`);
+    else if (a.startsWith('-')) return fail(`su: invalid option -- '${a[1]}'${usage}`);
+    else name = a;
   }
-  sh.sessions.push({ user: u, cwd: login ? u.home : sh.cwd });
+  const target = name ?? 'root';
+  const u = findUser(sh, target);
+  if (!u) return fail(`su: user ${target} does not exist or the user entry does not contain all the required fields`);
+  if (sh.uid !== 0 && u.uid !== sh.uid) {
+    if (u.uid === 0) {
+      return fail('su: Authentication failure\n(The practice root password is not set. Use sudo -i instead, which is how RHEL admins usually become root.)');
+    }
+    if (!u.password || u.locked) {
+      return fail(`su: Authentication failure\n(${u.name} has no usable password, so su cannot log in as ${u.name}. Root needs no password: sudo su - ${u.name})`);
+    }
+  }
+  const shell = shellOpt !== null && sh.uid === 0 ? shellOpt : u.shell;
+  if (shell.endsWith('nologin') || shell.endsWith('/false')) return { stdout: 'This account is currently not available.\n', stderr: '', code: 1 };
+  const cwd = login ? u.home : sh.cwd;
+  if (command !== null) {
+    return runAs(sh, u, cwd, login ? null : undefined, [], () => sh.runString(command!, login ? '-bash' : 'bash', extra, stdin));
+  }
+  sh.sessions.push({ user: u, cwd });
   return ok();
+};
+
+/** visudo: check the sudoers files (-c, or -c -f FILE for one file). The full-screen editor is not available here. */
+const visudo: Command = (ctx) => {
+  const { sh, args } = ctx;
+  const { flags, values } = getopts(args, ['f', 'file']);
+  if (!flags.has('c') && !flags.has('check')) {
+    return fail(`visudo: full-screen editors are not available on the phone terminal.\nWrite a rule to a drop-in file, check it, then copy it into place:\n  echo 'anna ALL=(ALL) ALL' > anna.sudo\n  visudo -c -f anna.sudo\n  sudo cp anna.sudo /etc/sudoers.d/anna && sudo chmod 440 /etc/sudoers.d/anna`);
+  }
+  const file = values.f ?? values.file;
+  let sud;
+  if (file !== undefined) {
+    let text: string;
+    try {
+      text = sh.readFile(file);
+    } catch (e) {
+      return fail(`visudo: unable to open ${file}: ${e instanceof FsError ? errorText[e.reason] : String(e)}`);
+    }
+    sud = checkSudoersText(sh.state, text, file);
+  } else {
+    if (sh.uid !== 0) return fail('visudo: /etc/sudoers: Permission denied');
+    sud = readSudoers(sh.state);
+  }
+  const bad = sud.errors[0] ?? '';
+  const out = sud.files.filter((f) => !bad.includes(` ${f}:`)).map((f) => `${f}: parsed OK\n`).join('');
+  const warn = sud.warnings.map((w) => w.replace(/^sudo: /, 'visudo: ') + '\n').join('');
+  if (bad) return fail(warn + bad.replace(/^sudo: /gm, '').replace(/\n.*no valid sudoers sources.*$/m, ''), 1, out);
+  return { stdout: out, stderr: warn, code: 0 };
 };
 
 const exit: Command = ({ sh }) => {
@@ -1189,33 +1440,98 @@ const exit: Command = ({ sh }) => {
     sh.sessions.pop();
     return ok('logout\n');
   }
+  // the root shell of rescue or emergency mode: leaving it continues the boot to the default target
+  if (sh.uid === 0 && maintenanceTarget(sh.state.kernel.bootTarget)) return switchTarget(sh, 'default.target', null);
   return ok('You are at the top-level login shell. (Closing this would log you out of the practice server.)\n');
 };
 
 // ---------- system info ----------
 
-const hostname: Command = ({ sh, args }) => {
-  if (args[0] === '-s') return ok(sh.shortHost + '\n');
-  if (args[0] === '-I') return ok('192.168.4.100\n');
-  if (args[0]) {
-    const denied = needRoot(sh, 'hostname');
-    if (denied) return fail('hostname: you must be root to change the host name');
-    sh.state.hostname = args[0];
-  }
-  return ok(sh.state.hostname + '\n');
-};
+const HOST_RE = /^(?=.{1,64}$)[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
 
-const hostnamectl: Command = ({ sh, args }) => {
-  if (args[0] === 'set-hostname' || args[0] === 'hostname') {
-    if (!args[1]) return ok(sh.state.hostname + '\n');
-    const denied = needRoot(sh, 'hostnamectl');
-    if (denied) return fail('Could not set static hostname: Access denied');
-    sh.state.hostname = args[1];
+const ipv4Addresses = (sh: Shell) => sh.state.connections.flatMap((c) => c.applied.ipv4.map((a) => a.split('/')[0]));
+
+/**
+ * hostname: show the running (transient) host name, or set it until the next reboot.
+ * The static name in /etc/hostname, which hostnamectl set-hostname writes, comes back at boot.
+ */
+const hostname: Command = ({ sh, args }) => {
+  const { flags, operands } = getopts(args, ['F', 'file']);
+  const name = runningHostname(sh.state);
+  if (flags.has('help')) return ok('Usage: hostname [-b] {hostname|-F file}         set host name (from file)\n       hostname [-a|-A|-d|-f|-i|-I|-s|-y]       display formatted name\n       hostname                                 display host name\n');
+  if (operands.length) {
+    if (sh.uid !== 0) return fail('hostname: you must be root to change the host name');
+    if (!HOST_RE.test(operands[0])) return fail('hostname: the specified hostname is invalid');
+    sh.state.transientHostname = operands[0] === sh.state.hostname ? undefined : operands[0];
     return ok();
   }
-  return ok(
-    ` Static hostname: ${sh.state.hostname}\n       Icon name: computer-vm\n         Chassis: vm\nOperating System: Red Hat Enterprise Linux 10.0 (Coughlan)\n          Kernel: Linux 6.12.0-55.el10.x86_64\n    Architecture: x86-64\n`,
-  );
+  if (flags.has('s') || flags.has('short')) return ok(name.split('.')[0] + '\n');
+  if (flags.has('d') || flags.has('domain')) return ok(name.split('.').slice(1).join('.') + '\n');
+  if (flags.has('I') || flags.has('all-ip-addresses')) return ok(ipv4Addresses(sh).map((a) => a + ' ').join('') + '\n');
+  if (flags.has('i') || flags.has('ip-address')) return ok((ipv4Addresses(sh)[0] ?? '127.0.0.1') + '\n');
+  if (flags.has('a') || flags.has('alias')) return ok('\n');
+  return ok(name + '\n');
+};
+
+/** hostnamectl: the static name (/etc/hostname), the transient name and facts about the machine. */
+const hostnamectl: Command = ({ sh, args }) => {
+  const { flags, operands } = getopts(args);
+  const st = sh.state;
+  const only = flags.has('static') ? 'static' : flags.has('transient') ? 'transient' : flags.has('pretty') ? 'pretty' : null;
+  const [verb = 'status', value, ...extra] = operands;
+  switch (verb) {
+    case 'status': {
+      if (only === 'static') return ok(st.hostname + '\n');
+      if (only === 'transient') return ok(runningHostname(st) + '\n');
+      if (only === 'pretty') return ok('\n');
+      const rows: [string, string][] = [['Static hostname', st.hostname]];
+      if (st.transientHostname !== undefined) rows.push(['Transient hostname', st.transientHostname]);
+      rows.push(
+        ['Icon name', 'computer-vm'],
+        ['Chassis', 'vm'],
+        ['Machine ID', machineId(st.root)],
+        ['Virtualization', 'vmware'],
+        ['Operating System', 'Red Hat Enterprise Linux 10.0 (Coughlan)'],
+        ['CPE OS Name', 'cpe:/o:redhat:enterprise_linux:10.0'],
+        ['Kernel', `Linux ${st.kernel.running}`],
+        ['Architecture', 'x86-64'],
+        ['Hardware Vendor', 'VMware, Inc.'],
+        ['Hardware Model', 'VMware20,1'],
+        ['Firmware Version', 'VMW201.00V.24006586.B64.2406042154'],
+      );
+      const w = Math.max(...rows.map((r) => r[0].length));
+      return ok(rows.map(([k, v]) => `${k.padStart(w)}: ${v}\n`).join(''));
+    }
+    case 'hostname':
+    case 'set-hostname': {
+      if (value === undefined) {
+        if (verb === 'set-hostname') return fail('Too few arguments.');
+        return ok((only === 'static' ? st.hostname : only === 'pretty' ? '' : runningHostname(st)) + '\n');
+      }
+      if (extra.length) return fail('Too many arguments.');
+      const what = only ?? 'static';
+      if (sh.uid !== 0) return fail(`Could not set ${what} hostname: Access denied`);
+      if (only === 'pretty') return ok();
+      if (!HOST_RE.test(value)) return fail(`Invalid ${what} hostname '${value}'`);
+      if (only === 'transient') {
+        st.transientHostname = value === st.hostname ? undefined : value;
+        return ok();
+      }
+      // with --static only /etc/hostname changes; without it the running name changes too
+      const running = runningHostname(st);
+      st.hostname = value;
+      st.transientHostname = only === 'static' && running !== value ? running : undefined;
+      return ok();
+    }
+    case 'chassis':
+    case 'icon-name':
+    case 'deployment':
+    case 'location':
+      if (value === undefined) return ok(`${verb === 'chassis' ? 'vm' : verb === 'icon-name' ? 'computer-vm' : ''}\n`);
+      return sh.uid === 0 ? ok() : fail(`Could not set property: Access denied`);
+    default:
+      return fail(`Unknown command verb '${verb}'.`);
+  }
 };
 
 const uname: Command = ({ args }) => {
@@ -1225,9 +1541,157 @@ const uname: Command = ({ args }) => {
   return ok('Linux\n');
 };
 
-const date: Command = () => ok(new Date().toString() + '\n');
+// ---------- date ----------
 
-const uptime: Command = () => ok(' 15:42:07 up 3 days,  4:11,  1 user,  load average: 0.08, 0.03, 0.01\n');
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+/** Wall-clock fields of a moment in a time zone, with the zone's abbreviation and UTC offset in minutes. */
+function zonedTime(ms: number, tz: string) {
+  let offset = 0;
+  let abbr = 'UTC';
+  if (tz !== 'UTC') {
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric', timeZoneName: 'short' }).formatToParts(new Date(ms));
+      const get = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? 0);
+      offset = Math.round((Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second')) - Math.floor(ms / 1000) * 1000) / 60_000);
+      // en-US knows EDT and PDT, en-GB knows CEST and BST; other zones show their offset, like +0530
+      const gb = new Intl.DateTimeFormat('en-GB', { timeZone: tz, timeZoneName: 'short' }).formatToParts(new Date(ms));
+      const name = [parts, gb].map((ps) => ps.find((p) => p.type === 'timeZoneName')?.value ?? '').find((n) => /^[A-Z]{3,5}$/.test(n));
+      const abs = Math.abs(offset);
+      abbr = name ?? `${offset < 0 ? '-' : '+'}${String(Math.floor(abs / 60)).padStart(2, '0')}${abs % 60 ? String(abs % 60).padStart(2, '0') : ''}`;
+    } catch {
+      // no time zone data: show UTC
+    }
+  }
+  const d = new Date(ms + offset * 60_000);
+  return { y: d.getUTCFullYear(), mo: d.getUTCMonth(), d: d.getUTCDate(), h: d.getUTCHours(), mi: d.getUTCMinutes(), s: d.getUTCSeconds(), wd: d.getUTCDay(), ms, offset, abbr };
+}
+
+/** strftime as GNU date formats it in the en_US.UTF-8 locale, with the - _ 0 flags. */
+function strftime(fmt: string, t: ReturnType<typeof zonedTime>): string {
+  const yday = Math.floor((Date.UTC(t.y, t.mo, t.d) - Date.UTC(t.y, 0, 1)) / 86_400_000) + 1;
+  const h12 = t.h % 12 || 12;
+  const off = (colon: boolean) => {
+    const a = Math.abs(t.offset);
+    return `${t.offset < 0 ? '-' : '+'}${String(Math.floor(a / 60)).padStart(2, '0')}${colon ? ':' : ''}${String(a % 60).padStart(2, '0')}`;
+  };
+  const pad = (n: number, w: number, flag: string, space = false) => (flag === '-' ? String(n) : String(n).padStart(w, flag === '_' || (space && flag !== '0') ? ' ' : '0'));
+  const one = (c: string, flag: string): string | null => {
+    switch (c) {
+      case 'Y': return String(t.y);
+      case 'C': return pad(Math.floor(t.y / 100), 2, flag);
+      case 'y': return pad(t.y % 100, 2, flag);
+      case 'm': return pad(t.mo + 1, 2, flag);
+      case 'd': return pad(t.d, 2, flag);
+      case 'e': return pad(t.d, 2, flag, true);
+      case 'H': return pad(t.h, 2, flag);
+      case 'k': return pad(t.h, 2, flag, true);
+      case 'I': return pad(h12, 2, flag);
+      case 'l': return pad(h12, 2, flag, true);
+      case 'M': return pad(t.mi, 2, flag);
+      case 'S': return pad(t.s, 2, flag);
+      case 'N': return String((t.ms % 1000) * 1_000_000).padStart(9, '0');
+      case 'p': return t.h < 12 ? 'AM' : 'PM';
+      case 'P': return t.h < 12 ? 'am' : 'pm';
+      case 'a': return WEEKDAYS[t.wd].slice(0, 3);
+      case 'A': return WEEKDAYS[t.wd];
+      case 'b': case 'h': return MONTH_NAMES[t.mo].slice(0, 3);
+      case 'B': return MONTH_NAMES[t.mo];
+      case 'j': return pad(yday, 3, flag);
+      case 'u': return String(t.wd || 7);
+      case 'w': return String(t.wd);
+      case 's': return String(Math.floor(t.ms / 1000));
+      case 'Z': return t.abbr;
+      case 'z': return off(false);
+      case 'F': return `${t.y}-${pad(t.mo + 1, 2, '')}-${pad(t.d, 2, '')}`;
+      case 'T': return `${pad(t.h, 2, '')}:${pad(t.mi, 2, '')}:${pad(t.s, 2, '')}`;
+      case 'R': return `${pad(t.h, 2, '')}:${pad(t.mi, 2, '')}`;
+      case 'D': case 'x': return `${pad(t.mo + 1, 2, '')}/${pad(t.d, 2, '')}/${pad(t.y % 100, 2, '')}`;
+      case 'r': return `${pad(h12, 2, '')}:${pad(t.mi, 2, '')}:${pad(t.s, 2, '')} ${t.h < 12 ? 'AM' : 'PM'}`;
+      case 'X': return one('r', '');
+      case 'c': return `${one('a', '')} ${one('d', '')} ${one('b', '')} ${t.y} ${one('r', '')} ${t.abbr}`;
+      case 'n': return '\n';
+      case 't': return '\t';
+      case '%': return '%';
+      default: return null;
+    }
+  };
+  return fmt.replace(/%([-_0^]?)(:?)([A-Za-z%])/g, (all, flag: string, colon: string, c: string) => {
+    if (colon) return c === 'z' ? off(true) : all;
+    const v = one(c, flag === '^' ? '' : flag);
+    if (v === null) return all;
+    return flag === '^' ? v.toUpperCase() : v;
+  });
+}
+
+/** The few -d forms scripts use: now, today, yesterday, tomorrow, N days ago, +N days, @EPOCH, YYYY-MM-DD [HH:MM[:SS]]. */
+function parseDateArg(text: string, now: number, tz: string): number | null {
+  const s = text.trim().toLowerCase();
+  if (s === '' || s === 'now' || s === 'today') return now;
+  if (s === 'yesterday') return now - 86_400_000;
+  if (s === 'tomorrow') return now + 86_400_000;
+  let m = /^@(-?\d+)$/.exec(s);
+  if (m) return Number(m[1]) * 1000;
+  const units: Record<string, number> = { sec: 1000, second: 1000, min: 60_000, minute: 60_000, hour: 3_600_000, day: 86_400_000, week: 604_800_000 };
+  m = /^([+-]?\d+)\s*(sec|second|min|minute|hour|day|week)s?(\s+ago)?$/.exec(s);
+  if (m) return now + Number(m[1]) * units[m[2]] * (m[3] ? -1 : 1);
+  m = /^(next|last)\s+(day|week)$/.exec(s);
+  if (m) return now + units[m[2]] * (m[1] === 'next' ? 1 : -1);
+  m = /^(\d{4})-(\d\d)-(\d\d)(?:[ t](\d\d?):(\d\d)(?::(\d\d))?)?$/.exec(s);
+  if (!m) return null;
+  // a date and time on the server's clock (its time zone), not in UTC
+  const wall = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4] ?? 0), Number(m[5] ?? 0), Number(m[6] ?? 0));
+  return wall - zonedTime(wall, tz).offset * 60_000;
+}
+
+const date: Command = ({ sh, args }) => {
+  const utc = args.some((a) => a === '-u' || a === '--utc' || a === '--universal');
+  const tz = utc ? 'UTC' : sh.state.timezone;
+  let when = Date.now();
+  let fmt: string | null = null;
+  let iso: string | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-u' || a === '--utc' || a === '--universal') continue;
+    if (a === '-d' || a.startsWith('--date=') || (a.startsWith('-d') && a.length > 2)) {
+      const v = a === '-d' ? args[++i] : a.startsWith('--date=') ? a.slice(7) : a.slice(2);
+      if (v === undefined) return fail("date: option requires an argument -- 'd'\nTry 'date --help' for more information.");
+      const t = parseDateArg(v, Date.now(), tz);
+      if (t === null) return fail(`date: invalid date ‘${v}’`);
+      when = t;
+    } else if (a === '-I' || a.startsWith('--iso-8601') || (a.startsWith('-I') && a.length > 2)) iso = a.replace(/^(-I|--iso-8601=?)/, '') || 'date';
+    else if (a === '-R' || a === '--rfc-email') fmt = '%a, %d %b %Y %H:%M:%S %z';
+    else if (a === '-s' || a.startsWith('--set')) return sh.uid === 0 ? fail('date: setting the time is not possible in the practice terminal; use timedatectl') : fail('date: cannot set date: Operation not permitted');
+    else if (a.startsWith('+')) {
+      if (fmt !== null) return fail(`date: extra operand ‘${a}’\nTry 'date --help' for more information.`);
+      fmt = a.slice(1);
+    } else return fail(`date: invalid date ‘${a}’`);
+  }
+  const t = zonedTime(when, tz);
+  if (iso !== null) {
+    const parts: Record<string, string> = { date: '%F', hours: '%FT%H%:z', minutes: '%FT%H:%M%:z', seconds: '%FT%T%:z', ns: '%FT%T,%N%:z' };
+    if (!parts[iso]) return fail(`date: invalid argument ‘${iso}’ for ‘--iso-8601’`);
+    fmt = parts[iso];
+  }
+  return ok(strftime(fmt ?? '%a %b %e %r %Z %Y', t) + '\n');
+};
+
+/** uptime from procps-ng 4: the time since the last (simulated) boot. */
+const uptime: Command = ({ sh, args }) => {
+  const now = Date.now();
+  const boot = sh.state.kernel.bootTime;
+  const mins = Math.max(0, Math.floor((now - boot) / 60_000));
+  const [days, hours, min] = [Math.floor(mins / 1440), Math.floor((mins % 1440) / 60), mins % 60];
+  const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  if (args.includes('-p') || args.includes('--pretty')) {
+    const parts = [days && plural(days, 'day'), hours && plural(hours, 'hour'), (min || mins === 0) && plural(min, 'minute')].filter(Boolean);
+    return ok(`up ${parts.join(', ')}\n`);
+  }
+  if (args.includes('-s') || args.includes('--since')) return ok(strftime('%F %T', zonedTime(boot, sh.state.timezone)) + '\n');
+  const up = (days ? `${plural(days, 'day')}, ` : '') + (hours ? `${String(hours).padStart(2)}:${String(min).padStart(2, '0')}` : `${min} min`);
+  return ok(` ${strftime('%T', zonedTime(now, sh.state.timezone))} up ${up},  1 user,  load average: 0.08, 0.03, 0.01\n`);
+};
 
 
 const ping: Command = ({ args }) => {
@@ -1261,19 +1725,174 @@ const lsblk: Command = () =>
 
 // ---------- services, packages, security ----------
 
+// ---------- systemd targets ----------
+
+const TARGETS: Record<string, string> = {
+  'multi-user.target': 'Multi-User System',
+  'graphical.target': 'Graphical Interface',
+  'rescue.target': 'Rescue Mode',
+  'emergency.target': 'Emergency Mode',
+};
+// targets that exist but cannot be isolated (no AllowIsolate=yes)
+const OTHER_TARGETS: Record<string, string> = {
+  'basic.target': 'Basic System',
+  'sysinit.target': 'System Initialization',
+  'local-fs.target': 'Local File Systems',
+  'remote-fs.target': 'Remote File Systems',
+  'swap.target': 'Swaps',
+  'network.target': 'Network',
+  'network-online.target': 'Network is Online',
+  'timers.target': 'Timer Units',
+  'sockets.target': 'Socket Units',
+  'paths.target': 'Path Units',
+  'getty.target': 'Login Prompts',
+  'reboot.target': 'System Reboot',
+  'poweroff.target': 'System Power Off',
+  'halt.target': 'System Halt',
+};
+const maintenanceTarget = (t: string) => t === 'rescue.target' || t === 'emergency.target';
+
+/** Is a target active in the running system? multi-user.target is part of graphical.target. */
+function targetActive(sh: Shell, unit: string): boolean {
+  const b = sh.state.kernel.bootTarget;
+  const t = unit === 'default.target' ? sh.state.defaultTarget : unit;
+  if (t === b) return true;
+  if (TARGETS[t]) return t === 'multi-user.target' && b === 'graphical.target';
+  if (['reboot.target', 'poweroff.target', 'halt.target'].includes(t) || b === 'emergency.target') return false;
+  if (b === 'rescue.target') return ['sysinit.target', 'local-fs.target', 'swap.target'].includes(t);
+  return !!OTHER_TARGETS[t];
+}
+
+/** data.mount -> /data, var-www.mount -> /var/www, -.mount -> / */
+const mountPath = (unit: string) => {
+  const p = unit.replace(/\.mount$/, '');
+  return p === '-' ? '/' : '/' + p.split('-').map((x) => x.replace(/\\x([0-9a-f]{2})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)))).join('/');
+};
+
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+/** Wed 2026-10-21 10:00:00 EDT, as wall and systemctl print dates */
+function longDate(ms: number) {
+  const d = new Date(ms);
+  const p2 = (n: number) => String(n).padStart(2, '0');
+  return `${DAY_NAMES[d.getDay()]} ${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())} EDT`;
+}
+
+/** Append lines to the log, the way rsyslog writes what systemd logs. */
+function logMessages(sh: Shell, lines: string[]): void {
+  const log = nodeAt(sh.state.root, '/var/log/messages');
+  if (log?.type !== 'file') return;
+  const d = new Date();
+  const p2 = (n: number) => String(n).padStart(2, '0');
+  const when = `${MONTHS[d.getMonth()]} ${String(d.getDate()).padStart(2)} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+  log.content = (log.content ?? '') + lines.map((l) => `${when} ${sh.shortHost} ${l}\n`).join('');
+}
+
+/**
+ * systemctl isolate, rescue, emergency and default: switch the running system to another target.
+ * Services the target does not want stop. Rescue and emergency mode log everyone out and leave
+ * root on the console; going back to a normal target logs student in again.
+ */
+function switchTarget(sh: Shell, unit: string, wall: 'rescue' | 'emergency' | null): CommandResult {
+  const st = sh.state;
+  const k = st.kernel;
+  const target = unit === 'default.target' ? st.defaultTarget : unit;
+  if (target === 'reboot.target') return rebootSystem({ sh, args: [], stdin: '', name: 'reboot' });
+  if (target === 'poweroff.target' || target === 'halt.target') return ok('(Practice server: pretending to power off. Your changes are kept. Use "reboot" to practise a restart.)\n');
+  if (!TARGETS[target]) {
+    if (OTHER_TARGETS[target] || st.services[target.replace(/\.service$/, '')]) return fail(`Failed to start ${target}: Operation refused, unit may not be isolated.`);
+    return fail(`Failed to start ${target}: Unit ${target} not found.`);
+  }
+  const from = k.bootTarget;
+  const into = maintenanceTarget(target);
+  let out = '';
+  if (wall) {
+    out += `\nBroadcast message from root@${sh.shortHost} on pts/0 (${longDate(Date.now())}):\n\nThe system is going down to ${wall} mode NOW!\n\n`;
+  }
+  if (target === from) return ok(out);
+  if (from === 'emergency.target' && !into) {
+    // local-fs.target again: every /etc/fstab line has to mount now
+    const broken = fstabCheck(st).filter((c) => c.error && !c.entry.options.includes('nofail'));
+    if (broken.length) {
+      logMessages(sh, [...broken.map((c) => `systemd[1]: ${c.error!.trim()}`), 'systemd[1]: Dependency failed for local-fs.target - Local File Systems.']);
+      return fail(`A dependency job for ${target} failed. See 'journalctl -xe' for details.`);
+    }
+    sh.exec(['mount', '-a']);
+    sh.exec(['swapon', '-a']);
+  }
+  const fw = st.services.firewalld;
+  const fwWasActive = fw?.active;
+  for (const s of Object.values(st.services)) s.active = into ? s.name === 'systemd-journald' : s.enabled;
+  if (fw && fw.active !== fwWasActive) {
+    // firewalld starts again from its permanent configuration
+    st.firewall.services = [...st.firewall.permServices];
+    st.firewall.ports = [...st.firewall.permPorts];
+  }
+  k.bootTarget = target;
+  k.emergency = target === 'emergency.target';
+  if (!into) k.bootErrors = [];
+  logMessages(sh, [`systemd[1]: Reached target ${target} - ${TARGETS[target]}.`]);
+  const root = st.users.find((u) => u.uid === 0)!;
+  if (into) {
+    sh.sessions = [{ user: root, cwd: root.home }];
+    sh.env = {};
+    const mode = target === 'rescue.target' ? 'rescue' : 'emergency';
+    out += `You are in ${mode} mode. After logging in, type "journalctl -xb" to view\nsystem logs, "systemctl reboot" to reboot, or "exit"\nto continue bootup.\n`;
+    out +=
+      root.locked || !root.password
+        ? 'Cannot open access to console, the root account is locked.\nSee sulogin(8) man page for more details.\n\nPress Enter to continue.\n(Practice server: a real server would be stuck here, because root has no usable password. This terminal gives you a root shell anyway.)\n'
+        : 'Give root password for maintenance\n(or press Control-D to continue):\n';
+    out += `(Practice server: ${target} stopped the other services and ended every login. You are root on the console. Type "systemctl default" or "exit" to go on to ${st.defaultTarget}.)\n`;
+  } else if (maintenanceTarget(from)) {
+    const student = st.users.find((u) => u.name === 'student') ?? root;
+    sh.sessions = [{ user: student, cwd: student.home }];
+    sh.env = {};
+    out += `(Practice server: reached ${target}. The ${from === 'rescue.target' ? 'rescue' : 'emergency'} shell ended, and you are logged in as ${student.name} again.)\n`;
+  }
+  return ok(out);
+}
+
+/** Failed units: mount points from this boot's errors that are still not mounted. */
+function failedUnits(sh: Shell): { unit: string; desc: string }[] {
+  const st = sh.state;
+  const out: { unit: string; desc: string }[] = [];
+  for (const e of st.kernel.bootErrors) {
+    const m = /^mount: (\/[^:]*):/.exec(e.trim());
+    if (m && !st.storage.mounts.some((x) => x.target === m[1])) out.push({ unit: mountUnit(m[1]), desc: m[1] });
+  }
+  return out;
+}
+
 const systemctl: Command = ({ sh, args }) => {
-  const { flags, operands } = getopts(args);
+  const { flags, values, operands } = getopts(args, ['t', 'type', 'state']);
   const [verb, ...units] = operands;
+  const quiet = flags.has('q') || flags.has('quiet');
   const svcName = (u: string) => u.replace(/\.service$/, '');
   const unit = (n: string) => (n.includes('.') ? n : `${n}.service`);
   const get = (u: string) => sh.state.services[svcName(u)];
-  const changes = ['start', 'stop', 'restart', 'reload', 'enable', 'disable', 'set-default', 'isolate', 'mask', 'unmask', 'daemon-reload'];
+  const changes = ['start', 'stop', 'restart', 'reload', 'enable', 'disable', 'set-default', 'mask', 'unmask', 'daemon-reload'];
   if (changes.includes(verb ?? '') && sh.uid !== 0) {
     return fail(`Failed to ${verb} ${units[0] ?? ''}: Access denied\n(Hint: use sudo systemctl ${verb} ${units.join(' ')})`);
+  }
+  const targetVerbs: Record<string, string> = { rescue: 'rescue.target', emergency: 'emergency.target', default: 'default.target' };
+  if ((verb === 'isolate' || targetVerbs[verb ?? '']) && sh.uid !== 0) {
+    const t = verb === 'isolate' ? (units[0] ?? '') : targetVerbs[verb!];
+    return fail(`Failed to start ${t.includes('.') || !t ? t : `${t}.target`}: Interactive authentication required.\nSee system logs and 'systemctl status ${t}' for details.\n(Hint: use sudo systemctl ${[verb, ...units].join(' ')})`);
+  }
+  if ((flags.has('failed') || values.state === 'failed') && (verb === undefined || verb === 'list-units')) {
+    const rows = failedUnits(sh);
+    const w = Math.max(4, ...rows.map((r) => r.unit.length));
+    const body = rows.map((r) => `● ${r.unit.padEnd(w)} loaded failed failed ${r.desc}\n`).join('');
+    return ok(`  ${'UNIT'.padEnd(w)} LOAD   ACTIVE SUB    DESCRIPTION\n${body}\nLOAD   = Reflects whether the unit definition was properly loaded.\nACTIVE = The high-level unit activation state, i.e. generalization of SUB.\nSUB    = The low-level unit activation state, values depend on unit type.\n\n${rows.length} loaded units listed.\n`);
   }
   switch (verb) {
     case undefined:
     case 'list-units': {
+      if ((values.t ?? values.type) === 'target') {
+        const names = [...Object.keys(TARGETS), ...Object.keys(OTHER_TARGETS)].filter((t) => targetActive(sh, t) || flags.has('all')).sort();
+        const desc = (t: string) => TARGETS[t] ?? OTHER_TARGETS[t];
+        const rows = names.map((t) => `  ${t.padEnd(30)} loaded ${targetActive(sh, t) ? 'active   active' : 'inactive dead  '} ${desc(t)}`);
+        return ok(`  UNIT                           LOAD   ACTIVE   SUB    DESCRIPTION\n${rows.join('\n')}\n\n${rows.length} loaded units listed.\n`);
+      }
       const rows = Object.values(sh.state.services)
         .filter((s) => s.active || flags.has('all'))
         .map((s) => `  ${unit(s.name).padEnd(30)} loaded ${s.active ? 'active   running' : 'inactive dead   '} ${s.description}`);
@@ -1301,11 +1920,20 @@ const systemctl: Command = ({ sh, args }) => {
       sh.state.defaultTarget = t;
       return ok(`Removed '/etc/systemd/system/default.target'.\nCreated symlink '/etc/systemd/system/default.target' → '/usr/lib/systemd/system/${t}'.\n`);
     }
-    case 'isolate':
-      return ok();
+    case 'isolate': {
+      if (!units[0]) return fail('Too few arguments.');
+      if (units.length > 1) return fail('Too many arguments.');
+      return switchTarget(sh, units[0].includes('.') ? units[0] : `${units[0]}.target`, null);
+    }
+    case 'rescue':
+    case 'emergency':
+      return switchTarget(sh, targetVerbs[verb], verb);
+    case 'default':
+      return switchTarget(sh, 'default.target', null);
     case 'daemon-reload':
       return ok();
     case 'reboot':
+      return rebootSystem({ sh, args: [], stdin: '', name: 'reboot' });
     case 'poweroff':
       return ok(`(Practice server: pretending to ${verb}. Your changes are kept.)\n`);
   }
@@ -1313,11 +1941,38 @@ const systemctl: Command = ({ sh, args }) => {
   let out = '';
   let err = '';
   let code = 0;
+  const failed = failedUnits(sh).map((f) => f.unit);
   for (const u of units) {
     const s = get(u);
+    // targets and mount units: is-active, is-failed and status know their state
+    if (!s && (u.endsWith('.target') || u.endsWith('.mount')) && ['is-active', 'is-failed', 'is-enabled', 'status'].includes(verb)) {
+      const isTarget = u.endsWith('.target');
+      if (isTarget && !TARGETS[u] && !OTHER_TARGETS[u] && u !== 'default.target') {
+        if (verb === 'status') err += `Unit ${u} could not be found.\n`;
+        else out += verb === 'is-enabled' ? 'not-found\n' : 'inactive\n';
+        code = verb === 'status' ? 4 : verb === 'is-active' ? 3 : 1;
+        continue;
+      }
+      const state = failed.includes(u) ? 'failed' : isTarget ? (targetActive(sh, u) ? 'active' : 'inactive') : sh.state.storage.mounts.some((m) => mountUnit(m.target) === u) ? 'active' : 'inactive';
+      if (verb === 'is-enabled') out += isTarget ? (u === sh.state.defaultTarget ? 'indirect\n' : 'static\n') : 'generated\n';
+      else if (verb === 'is-active') {
+        out += state + '\n';
+        if (state !== 'active') code = 3;
+      } else if (verb === 'is-failed') {
+        out += state + '\n';
+        if (state !== 'failed') code = 1;
+      } else {
+        const desc = isTarget ? TARGETS[u] ?? OTHER_TARGETS[u] ?? TARGETS[sh.state.defaultTarget] : mountPath(u);
+        const dot = state === 'failed' ? '×' : state === 'active' ? '●' : '○';
+        const loaded = isTarget ? `/usr/lib/systemd/system/${u}; static` : `/etc/fstab; generated`;
+        out += `${dot} ${u} - ${desc}\n     Loaded: loaded (${loaded})\n     Active: ${state === 'active' ? 'active since Tue 2026-10-21 08:00:04 UTC' : state === 'failed' ? 'failed (Result: exit-code)' : 'inactive (dead)'}\n`;
+        if (state !== 'active') code = 3;
+      }
+      continue;
+    }
     if (!s) {
       if (verb === 'status') err += `Unit ${svcName(u)}.service could not be found.\n`;
-      else if (verb === 'is-active' || verb === 'is-enabled') out += verb === 'is-active' ? 'inactive\n' : 'not-found\n';
+      else if (verb === 'is-active' || verb === 'is-enabled' || verb === 'is-failed') out += verb === 'is-enabled' ? 'not-found\n' : 'inactive\n';
       else err += `Failed to ${verb} ${svcName(u)}.service: Unit ${svcName(u)}.service not found.\n`;
       code = verb === 'status' ? 4 : verb === 'is-active' ? 3 : 1;
       continue;
@@ -1327,6 +1982,7 @@ const systemctl: Command = ({ sh, args }) => {
       case 'restart':
       case 'reload':
         s.active = true;
+        if (s.name === 'systemd-journald' && verb !== 'reload') journaldStart(sh.state);
         break;
       case 'stop':
         s.active = false;
@@ -1349,6 +2005,11 @@ const systemctl: Command = ({ sh, args }) => {
         out += s.enabled ? 'enabled\n' : 'disabled\n';
         if (!s.enabled) code = 1;
         break;
+      case 'is-failed':
+        // the practice services never fail: is-failed is true only for a failed unit
+        out += s.active ? 'active\n' : 'inactive\n';
+        code = 1;
+        break;
       case 'status':
         out += `${s.active ? '●' : '○'} ${unit(s.name)} - ${s.description}\n     Loaded: loaded (/usr/lib/systemd/system/${unit(s.name)}; ${s.enabled ? 'enabled' : 'disabled'}; preset: disabled)\n     Active: ${s.active ? 'active (running) since Tue 2026-10-21 08:00:04 UTC' : 'inactive (dead)'}\n`;
         if (!s.active) code = 3;
@@ -1357,10 +2018,13 @@ const systemctl: Command = ({ sh, args }) => {
         return fail(`Unknown command verb '${verb}'.`);
     }
   }
-  return { stdout: out, stderr: err, code };
+  return { stdout: quiet && ['is-active', 'is-enabled', 'is-failed'].includes(verb) ? '' : out, stderr: err, code };
 };
 
-const dnf: Command = ({ sh, args, name }) => {
+const dnf: Command = (ctx) => {
+  const kernel = kernelDnf(ctx);
+  if (kernel) return kernel;
+  const { sh, args, name } = ctx;
   const { operands } = getopts(args);
   const [verb, ...pkgs] = operands;
   const known = (p: string) => AVAILABLE_PACKAGES[pkgKey(p)];
@@ -1425,7 +2089,10 @@ const dnf: Command = ({ sh, args, name }) => {
   }
 };
 
-const rpm: Command = ({ sh, args }) => {
+const rpm: Command = (ctx) => {
+  const kernel = kernelRpm(ctx);
+  if (kernel) return kernel;
+  const { sh, args } = ctx;
   const { flags, operands } = getopts(args);
   if (flags.has('q') && flags.has('a')) return ok(sh.state.installed.map((p) => `${p}-1.0-1.el10.x86_64`).join('\n') + '\n');
   if (flags.has('q') && flags.has('f')) return ok('coreutils-9.5-6.el10.x86_64\n');
@@ -1448,7 +2115,7 @@ const setenforce: Command = ({ sh, args }) => {
 };
 
 const sestatus: Command = ({ sh }) =>
-  ok(
+  sh.state.selinux === 'Disabled' ? ok('SELinux status:                 disabled\n') : ok(
     `SELinux status:                 enabled\nSELinuxfs mount:                /sys/fs/selinux\nLoaded policy name:             targeted\nCurrent mode:                   ${sh.state.selinux.toLowerCase()}\nMode from config file:          ${sh.state.selinuxConfigMode}\nPolicy MLS status:              enabled\n`,
   );
 
@@ -1501,32 +2168,6 @@ const history: Command = ({ sh }) => ok(sh.history.map((h, i) => `${String(i + 1
 
 const clear: Command = () => ({ stdout: '', stderr: '', code: 0, clear: true });
 
-const which: Command = ({ args }) => {
-  let out = '';
-  let err = '';
-  for (const a of args) {
-    if (COMMANDS[a]) out += `/usr/bin/${a}\n`;
-    else err += `/usr/bin/which: no ${a} in (/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin)\n`;
-  }
-  return { stdout: out, stderr: err, code: err ? 1 : 0 };
-};
-
-const typeCmd: Command = ({ args }) => {
-  const builtins = ['cd', 'echo', 'exit', 'history', 'umask', 'export', 'type', 'pwd', 'alias'];
-  return ok(args.map((a) => (builtins.includes(a) ? `${a} is a shell builtin` : COMMANDS[a] ? `${a} is /usr/bin/${a}` : `-bash: type: ${a}: not found`)).join('\n') + '\n');
-};
-
-const exportCmd: Command = ({ sh, args }) => {
-  for (const a of args) {
-    const [k, ...v] = a.split('=');
-    if (v.length) sh.env[k] = v.join('=');
-  }
-  return ok();
-};
-
-const env: Command = ({ sh }) =>
-  ok(['HOME', 'USER', 'PWD', 'SHELL', 'HOSTNAME', 'PATH'].map((k) => `${k}=${sh.getVar(k)}`).concat(Object.entries(sh.env).filter(([k]) => k !== 'OLDPWD').map(([k, v]) => `${k}=${v}`)).join('\n') + '\n');
-
 const man: Command = ({ args }) => {
   const topic = args.filter((a) => !/^\d$/.test(a) && a !== '-k')[0];
   if (args[0] === '-k') {
@@ -1549,74 +2190,6 @@ const help: Command = () => {
 
 const trueCmd: Command = () => ok();
 const falseCmd: Command = () => ({ stdout: '', stderr: '', code: 1 });
-
-const test: Command = ({ sh, args, name }) => {
-  const a = name === '[' ? args.slice(0, -1) : args;
-  if (name === '[' && args[args.length - 1] !== ']') return fail("[: missing `]'", 2);
-  const res = (v: boolean): CommandResult => ({ stdout: '', stderr: '', code: v ? 0 : 1 });
-  let neg = false;
-  if (a[0] === '!') {
-    neg = true;
-    a.shift();
-  }
-  const r = (v: boolean) => res(neg ? !v : v);
-  if (a.length === 2) {
-    const [op, p] = a;
-    const node = (() => {
-      try {
-        return sh.resolve(p).node;
-      } catch {
-        return null;
-      }
-    })();
-    switch (op) {
-      case '-e':
-        return r(!!node);
-      case '-f':
-        return r(node?.type === 'file');
-      case '-d':
-        return r(node?.type === 'dir');
-      case '-r':
-        return r(!!node && canAccess(node, 'r', sh.uid, sh.gids));
-      case '-w':
-        return r(!!node && canAccess(node, 'w', sh.uid, sh.gids));
-      case '-x':
-        return r(!!node && canAccess(node, 'x', sh.uid, sh.gids));
-      case '-s':
-        return r(!!node && nodeSize(node) > 0);
-      case '-z':
-        return r(p === '');
-      case '-n':
-        return r(p !== '');
-    }
-  }
-  if (a.length === 3) {
-    const [x, op, y] = a;
-    const nx = parseInt(x, 10);
-    const ny = parseInt(y, 10);
-    switch (op) {
-      case '=':
-      case '==':
-        return r(x === y);
-      case '!=':
-        return r(x !== y);
-      case '-eq':
-        return r(nx === ny);
-      case '-ne':
-        return r(nx !== ny);
-      case '-lt':
-        return r(nx < ny);
-      case '-le':
-        return r(nx <= ny);
-      case '-gt':
-        return r(nx > ny);
-      case '-ge':
-        return r(nx >= ny);
-    }
-  }
-  if (a.length === 1) return r(a[0] !== '');
-  return res(neg);
-};
 
 const crontab: Command = ({ sh, args, stdin }) => {
   const { flags, values } = getopts(args, ['u']);
@@ -1644,30 +2217,20 @@ const crontab: Command = ({ sh, args, stdin }) => {
   return fail('usage: crontab [-u user] [ -l | -r | - ]');
 };
 
-const journalctl: Command = ({ sh, args }) => {
-  if (sh.uid !== 0 && !sh.state.groups.find((g) => g.name === 'wheel')?.members.includes(sh.user.name)) {
-    return fail('Hint: You are currently not seeing messages from other users and the system.');
-  }
-  let text = sh.state.root.children!.var.children!.log.children!.messages.content ?? '';
-  const u = args.indexOf('-u');
-  if (u >= 0 && args[u + 1]) text = joinLines(lines(text).filter((l) => l.includes(args[u + 1].replace('.service', ''))));
-  if (args.includes('-p') && args[args.indexOf('-p') + 1] === 'err') text = joinLines(lines(text).filter((l) => /error|preventing|failed/i.test(l)));
-  const n = args.indexOf('-n');
-  if (n >= 0) text = joinLines(lines(text).slice(-parseInt(args[n + 1] ?? '10', 10)));
-  return ok(text || '-- No entries --\n');
-};
-
 export const COMMANDS: Record<string, Command> = {
-  pwd, cd, ls, mkdir, rmdir, touch, cat, echo, cp, mv, rm, ln, readlink, stat, file, find,
-  head: headTail(true), tail: headTail(false), wc, grep, egrep: grep, sort, uniq, cut, tr, awk, sed, tee,
+  pwd, cd, ls, mkdir, rmdir, touch, cat, echo, cp, mv, rm, ln, readlink, stat, file,
+  head: headTail(true), tail: headTail(false), wc, grep, egrep: grep, sort, uniq, cut, tee, ...TEXT_COMMANDS, ...FIND_COMMANDS,
   less: pager, more: pager, vim: editor, vi: editor, nano: editor,
   tar, gzip: compressCmd('.gz', false), gunzip: compressCmd('.gz', true), bzip2: compressCmd('.bz2', false), bunzip2: compressCmd('.bz2', true),
   whoami, id, groups: groupsCmd, useradd, usermod, userdel, groupadd, groupdel, groupmod, gpasswd, passwd, chage,
-  chmod, chown, chgrp: chown, umask, sudo, su, exit, logout: exit,
+  chmod, chown, chgrp: chown, umask, sudo, su, visudo, exit, logout: exit,
   hostname, hostnamectl, uname, date, uptime, ping, df, free, lsblk,
   systemctl, dnf, yum: dnf, rpm, getenforce, setenforce, sestatus, 'firewall-cmd': firewallCmd,
   journalctl, crontab,
-  history, clear, which, type: typeCmd, export: exportCmd, env, man, help,
-  true: trueCmd, false: falseCmd, test, '[': test,
+  history, clear, man, help,
+  true: trueCmd, false: falseCmd,
   ...ADMIN_COMMANDS,
+  ...STORAGE_COMMANDS,
+  ...KERNEL_COMMANDS,
+  ...SCRIPT_COMMANDS,
 };

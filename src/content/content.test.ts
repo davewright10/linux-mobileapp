@@ -25,7 +25,8 @@ for (const m of MODULES) {
       lab.tasks.forEach((t, i) => {
         assert.equal(t.check(sh), false, `task ${i + 1} passes before it is attempted: ${t.text}`);
         const cmd = t.hint.split(/\s{2,}\(/)[0];
-        const out = sh.run(cmd).output;
+        // A multi-line hint (a heredoc or a loop) is typed line by line, as in the terminal.
+        const out = cmd.includes('\n') ? cmd.split('\n').map((line) => sh.run(line).output).join('') : sh.run(cmd).output;
         assert.ok(t.check(sh), `task ${i + 1} "${t.text}" not passed by "${cmd}". Output:\n${out}`);
       });
     });

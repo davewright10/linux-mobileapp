@@ -43,6 +43,7 @@ const nmcli: Command = (ctx) => {
       if (args[2]) {
         if (!isRoot(ctx)) return fail('Error: Could not set hostname: Insufficient privileges.');
         ctx.sh.state.hostname = args[2];
+        ctx.sh.state.transientHostname = undefined; // like hostnamectl set-hostname: static and running name
         return ok();
       }
       return ok(ctx.sh.state.hostname + '\n');

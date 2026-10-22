@@ -1,3 +1,4 @@
+import type { FsNode } from '@/shell/fs';
 import { R10, R11, R12, R8, R9 } from './rhcsa-8-12';
 import { R1, R13, R14, R15, R16, R17, R18, R19, R20, R21, R22, R23, R24, R25, R26 } from './rhcsa-rest';
 import { Module, groupByName, groupOf, inGroup, ownerName, peek, permBits, ran, userByName } from './types';
@@ -215,6 +216,63 @@ const R3: Module = {
           text: 'Create a symbolic link /root/hosts-link that points to /restore/etc/hosts.',
           hint: 'ln -s /restore/etc/hosts /root/hosts-link',
           check: (sh) => peek(sh, '/root/hosts-link', false)?.target === '/restore/etc/hosts',
+        },
+      ],
+    },
+    {
+      id: 'R3-find',
+      title: 'Find files and copy them',
+      intro: 'User anna has files in several places on server1. Collect them the way an exam task asks: with find.',
+      setup: (sh) => {
+        for (const c of [
+          'sudo useradd anna',
+          'sudo mkdir -p /home/anna/projects /srv/shared',
+          'echo "meeting at 10" | sudo tee /home/anna/notes.txt /home/anna/projects/report.txt /srv/shared/anna-todo.txt /tmp/anna.tmp',
+          'seq 1 500 | sudo tee /home/anna/projects/data.csv',
+          'sudo chown -R anna:anna /home/anna /srv/shared/anna-todo.txt /tmp/anna.tmp',
+        ])
+          sh.run(c);
+        sh.history.length = 0;
+      },
+      tasks: [
+        { text: 'Become root.', hint: 'sudo -i', check: (sh) => sh.uid === 0 || ran(sh, /^sudo\s+-i|^sudo su/) },
+        {
+          text: 'Create the directory /root/anna-files.',
+          hint: 'mkdir /root/anna-files',
+          check: (sh) => peek(sh, '/root/anna-files')?.type === 'dir',
+        },
+        {
+          text: 'Copy every regular file that anna owns, wherever it is, into /root/anna-files.',
+          hint: 'find / -user anna -type f -exec cp {} /root/anna-files \\;',
+          check: (sh) => {
+            const anna = userByName(sh, 'anna');
+            const dest = peek(sh, '/root/anna-files');
+            if (!anna || dest?.type !== 'dir') return false;
+            const missing: string[] = [];
+            const walk = (n: FsNode, name: string, path: string) => {
+              if (path === '/root/anna-files' || path === '/proc' || path === '/sys') return;
+              if (n.type === 'file' && n.uid === anna.uid && !dest.children![name]) missing.push(path);
+              if (n.type === 'dir') for (const [k, c] of Object.entries(n.children!)) walk(c, k, `${path === '/' ? '' : path}/${k}`);
+            };
+            walk(sh.state.root, '/', '/');
+            return missing.length === 0 && !!dest.children!['data.csv'];
+          },
+        },
+        {
+          text: 'Save the full path of every file anna owns that is bigger than 1 KiB in /root/anna-big.',
+          hint: 'find / -user anna -type f -size +1k > /root/anna-big',
+          check: (sh) => {
+            const anna = userByName(sh, 'anna');
+            const list = (peek(sh, '/root/anna-big')?.content ?? '').split('\n').filter(Boolean);
+            return (
+              !!anna &&
+              list.includes('/home/anna/projects/data.csv') &&
+              list.every((p) => {
+                const n = peek(sh, p);
+                return n?.type === 'file' && n.uid === anna.uid && (n.content ?? '').length > 1024;
+              })
+            );
+          },
         },
       ],
     },

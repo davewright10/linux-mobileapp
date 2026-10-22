@@ -6,7 +6,7 @@ import { getLab } from '@/content';
 import { useProgress } from '@/lib/progress';
 import { colors, mono, space } from '@/lib/theme';
 import { complete } from '@/shell/complete';
-import { Shell } from '@/shell/shell';
+import { RunOutput, Shell } from '@/shell/shell';
 
 interface Line {
   text: string;
@@ -14,7 +14,7 @@ interface Line {
 }
 
 const WELCOME = 'Red Hat Enterprise Linux 10.0 practice server (simulated).\nType "help" to see the commands you can use.\n';
-const KEYS = ['Tab', '↑', '↓', '|', '/', '-', '~', '>', '*', '$', '&&', 'Clear'];
+const KEYS = ['Tab', '^C', '↑', '↓', '|', '/', '-', '~', '>', '*', '$', '&&', 'Clear'];
 const MAX_LINES = 400;
 
 export default function TerminalScreen() {
@@ -53,10 +53,19 @@ export default function TerminalScreen() {
   const submit = () => {
     const sh = shell;
     const cmd = input;
-    const result = sh.run(cmd);
+    let result: RunOutput;
+    try {
+      result = sh.run(cmd);
+    } catch (e) {
+      // Shell.run reports its own errors; this only guards against a bug crashing the screen
+      sh.cancelInput();
+      result = { output: `-bash: the practice terminal could not run this command (${e instanceof Error ? e.message : String(e)})\n`, clear: false };
+    }
     const echo = { text: prompt + cmd, cmd: true };
-    if (result.clear) setLines([]);
-    else append(result.output ? [echo, { text: result.output.replace(/\n$/, '') }] : [echo]);
+    // one Text per output line, so MAX_LINES also limits how much a long output keeps on screen
+    const out = result.output ? result.output.replace(/\n$/, '').split('\n').map((text) => ({ text })) : [];
+    if (result.clear) setLines(out); // clear empties the screen; what comes after it stays
+    else append([echo, ...out]);
     setInput('');
     setPrompt(sh.prompt());
     historyPos.current = null;
@@ -77,6 +86,13 @@ export default function TerminalScreen() {
       pos = k === '↑' ? Math.max(0, pos - 1) : Math.min(h.length, pos + 1);
       historyPos.current = pos;
       setInput(h[pos] ?? '');
+    } else if (k === '^C') {
+      // Ctrl+C: throw away an unfinished multi-line command (the "> " prompt) or the line being typed
+      append([{ text: prompt + input + '^C', cmd: true }]);
+      sh.cancelInput();
+      setInput('');
+      setPrompt(sh.prompt());
+      historyPos.current = null;
     } else if (k === 'Clear') {
       setInput('');
     } else {
@@ -95,7 +111,7 @@ export default function TerminalScreen() {
   };
 
   const tutorContext = useMemo(() => {
-    const recent = lines.slice(-12).map((l) => l.text).join('\n');
+    const recent = lines.slice(-30).map((l) => l.text).join('\n');
     const task = lab && current >= 0 ? `Lab "${lab.title}", current task: ${lab.tasks[current].text}\n` : '';
     return `${task}Recent practice terminal output:\n${recent}`;
   }, [lines, lab, current]);
