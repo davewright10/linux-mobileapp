@@ -965,6 +965,7 @@ const typeCmd: Command = ({ sh, args }) => {
     else if (mode) out += d.kind === 'file' ? `${d.path}\n` : '';
     else if (d.kind === 'file') out += `${n} is ${d.path}\n`;
     else if (d.kind === 'function') out += `${n} is a function\n${d.text}`;
+    else if (d.kind === 'alias') out += `${n} is aliased to \`${d.text}'\n`;
     else out += `${n} is a shell ${d.kind}\n`;
   }
   return { stdout: out, stderr: err, code };

@@ -123,6 +123,9 @@ export const pkgName = (key: string) => key.replace(/_/g, '-');
 /** The host name the running system uses (prompt, uname -n): the transient name if one is set. */
 export const runningHostname = (state: SystemState) => state.transientHostname ?? state.hostname;
 
+/** The aliases a new login has: the student's ~/.bashrc defines ll. */
+export const DEFAULT_ALIASES: [string, string][] = [['ll', 'ls -l']];
+
 const OS_RELEASE = `NAME="Red Hat Enterprise Linux"
 VERSION="10.0 (Coughlan)"
 ID="rhel"

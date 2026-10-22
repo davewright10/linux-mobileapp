@@ -70,7 +70,7 @@ import {
 } from './kernel-state';
 import type { Shell } from './shell';
 import { journaldStart, mountUnit } from './journal';
-import { AVAILABLE_PACKAGES, pkgKey, runningHostname } from './state';
+import { AVAILABLE_PACKAGES, DEFAULT_ALIASES, pkgKey, runningHostname } from './state';
 import { parseFstab, readFstab } from './storage-state';
 import type { NmConnection, SystemState, User } from './state';
 
@@ -210,6 +210,7 @@ function freshLogin(sh: Shell, user: User): void {
   sh.sessions = [{ user, cwd: user.home }];
   sh.env = {};
   sh.functions = new Map();
+  sh.aliases = new Map(DEFAULT_ALIASES);
 }
 
 const bootPath = (p: string) => (p.startsWith('/boot/') ? p : `/boot${p}`);

@@ -651,3 +651,63 @@ test('helpers for other parts of the app', () => {
   assert.equal(sh.runScript('x.sh', ['z'], '').stdout, 'args: z\n');
   assert.equal(sh.runString('echo $0-$1', 'name', ['v'], '').stdout, 'name-v\n');
 });
+
+test('broken input is reported, never thrown, and long output is cut', () => {
+  const sh = new Shell();
+  // a here-document body with a lone ` or an unclosed $( fails the command, like bash
+  assert.equal(typed(sh, 'cat <<EOF\na `b\nEOF'), '-bash: bad substitution: no closing "`" in `b\n');
+  assert.match(typed(sh, 'cat <<EOF\nx $(y\nEOF\necho $?'), /matching `\)'\n1\n$/);
+  assert.equal(sh.prompt().endsWith('$ '), true);
+  // deep nesting stops with a message instead of overflowing the stack
+  assert.match(out(sh, 'echo ' + '$('.repeat(3000) + ')'.repeat(3000)), /practice terminal limit/);
+  assert.equal(out(sh, 'echo still here'), 'still here\n');
+  // the screen keeps the end of a very long output
+  const long = out(sh, 'for i in $(seq 1 9000); do echo line $i; done');
+  assert.ok(long.length < 60_000);
+  assert.match(long, /^\[\d+ earlier lines not shown \(practice terminal limit\)\]\n/);
+  assert.ok(long.endsWith('line 9000\n'));
+  assert.equal(out(sh, 'seq 1 20000 | wc -l'), '20000\n');
+});
+
+test('a here-document inside $( ) may contain quotes and )', () => {
+  const sh = new Shell();
+  assert.equal(typed(sh, "x=$(cat <<EOF\nit's (really) done)\nEOF\n)\necho \"$x\""), "it's (really) done)\n");
+  assert.equal(typed(sh, "n=$(wc -l <<-'END'\n\tone\n\ttwo\n\tEND\n); echo $n"), '2\n');
+});
+
+test('"$@" in one-word places joins the arguments with spaces', () => {
+  const sh = new Shell();
+  assert.equal(out(sh, 'set -- a b c; x="$@"; y=$@; echo "$x|$y"'), 'a b c|a b c\n');
+  assert.equal(out(sh, 'set -- a b; [[ "$@" == "a b" ]] && echo same'), 'same\n');
+  assert.equal(out(sh, 'set -- a b; case "$@" in "a b") echo matched;; esac'), 'matched\n');
+  assert.equal(typed(sh, 'set -- one two\ncat <<EOF\nargs: $@\nEOF'), 'args: one two\n');
+  assert.equal(out(sh, 'set -- p q; for w in "$@"; do echo "<$w>"; done'), '<p>\n<q>\n');
+});
+
+test('return, break and continue stay inside subshells and functions', () => {
+  const sh = new Shell();
+  assert.equal(out(sh, 'f() { (return 3); echo "after $?"; }; f'), 'after 3\n');
+  assert.equal(out(sh, 'g() { x=$(return 4); echo "got $?"; }; g'), 'got 4\n');
+  const loop = "-bash: break: only meaningful in a `for', `while', or `until' loop\n";
+  assert.equal(out(sh, 'for i in 1 2; do (break); echo $i; done'), `${loop}1\n${loop}2\n`);
+  assert.equal(out(sh, 'b() { break; }; for i in 1 2; do b; echo $i; done'), `${loop}1\n${loop}2\n`);
+  assert.equal(out(sh, 'for i in 1 2; do echo x | while read l; do break 2; done; echo $i; done'), '1\n2\n');
+  // a loop inside the function still works
+  assert.equal(out(sh, 'h() { for j in a b c; do [ $j = b ] && break; echo $j; done; }; for i in 1; do h; done'), 'a\n');
+});
+
+test('aliases at the prompt, but not in scripts', () => {
+  const sh = new Shell();
+  assert.equal(out(sh, 'alias'), "alias ll='ls -l'\n");
+  assert.equal(out(sh, 'source ~/.bashrc && echo sourced'), 'sourced\n');
+  assert.match(out(sh, 'll -d /tmp'), /^drwxrwxrwt\. .* \/tmp\n$/);
+  assert.equal(out(sh, 'type ll; type -t ll; command -v ll'), "ll is aliased to `ls -l'\nalias\nalias ll='ls -l'\n");
+  assert.equal(out(sh, "alias go='cd /etc; pwd'; go; cd"), '/etc\n');
+  assert.equal(out(sh, "alias ls='ls -d'; ls /etc; unalias ls; ls -d /etc"), '/etc\n/etc\n');
+  assert.equal(out(sh, "alias rmi='rm -i'; alias rmi"), "alias rmi='rm -i'\n");
+  assert.equal(out(sh, 'unalias nope; alias nope'), '-bash: unalias: nope: not found\n-bash: alias: nope: not found\n');
+  assert.equal(out(sh, "alias 'a b=1'"), "-bash: alias: `a b': invalid alias name\n");
+  script(sh, '/home/student/s.sh', '#!/bin/bash\nll /\n');
+  assert.equal(out(sh, './s.sh'), './s.sh: line 2: ll: command not found\n');
+  assert.equal(out(sh, 'unalias -a; alias'), '');
+});

@@ -167,10 +167,29 @@ function skipDouble(s: string, i: number): number {
 function scanParen(s: string, i: number): number {
   let depth = 1;
   let cases = 0; // inside case ... esac, "a)" ends a pattern, not the $( )
+  const docs: { delim: string; strip: boolean }[] = []; // here-documents whose bodies start on the next line
   const cmdStart = (k: number) => /^$|[;&|({\n]$/.test(s.slice(0, k).replace(/[ \t]+$/, '').slice(-1));
   while (i < s.length) {
     const c = s[i];
     if (c === '\\') i += 2;
+    else if (c === '<' && s[i + 1] === '<' && s[i + 2] !== '<') {
+      const m = /^<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|([^\s;&|()<>]+))/.exec(s.slice(i, i + 200));
+      if (m) docs.push({ delim: m[2] ?? m[3] ?? m[4].replace(/['"\\]/g, ''), strip: m[1] === '-' });
+      i += m ? m[0].length : 2;
+    } else if (c === '\n' && docs.length) {
+      // skip the bodies: an apostrophe or ) in a here-document does not count
+      i++;
+      for (const d of docs) {
+        for (;;) {
+          if (i >= s.length) return -1;
+          const e = s.indexOf('\n', i);
+          const text = s.slice(i, e < 0 ? s.length : e);
+          i = e < 0 ? s.length : e + 1;
+          if ((d.strip ? text.replace(/^\t+/, '') : text) === d.delim) break;
+        }
+      }
+      docs.length = 0;
+    }
     else if (c === "'") {
       const e = s.indexOf("'", i + 1);
       if (e < 0) return -1;

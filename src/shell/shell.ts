@@ -34,7 +34,7 @@ import {
   splitAssign,
 } from './parser';
 import { KERNEL_FILES } from './kernel-state';
-import { SystemState, User, createInitialState, runningHostname } from './state';
+import { DEFAULT_ALIASES, SystemState, User, createInitialState, runningHostname } from './state';
 import { STORAGE_FILES } from './storage-state';
 
 type FuncDef = Extract<Command, { type: 'func' }>;
@@ -77,6 +77,8 @@ const MAX_STEPS = 200000; // simple commands in one command line
 const MAX_WORDS = 100000; // words from one brace expansion
 const MAX_FUNC_DEPTH = 100; // like FUNCNEST=100
 const MAX_SCRIPT_DEPTH = 40; // scripts and $( ) inside each other
+const MAX_SINK = 1_000_000; // characters one stream keeps
+const MAX_SCREEN = 50_000; // characters one command line shows on the phone
 
 /** Standard input of a command: read takes one line at a time, other commands take all of it. */
 export class InputStream {
@@ -116,6 +118,7 @@ class Sink {
     private fd: 1 | 2 = 1,
   ) {}
   write(s: string) {
+    if (this.text.length + s.length > MAX_SINK) s = s.slice(0, Math.max(0, MAX_SINK - this.text.length));
     if (!s) return;
     this.text += s;
     this.log?.push([this.fd, s]);
@@ -186,7 +189,7 @@ class ExpansionError extends Signal {
 }
 
 const DECL_BUILTINS = new Set(['export', 'local', 'declare', 'typeset', 'readonly']);
-const SHELL_BUILTINS = new Set(['break', 'continue', 'return', 'exit', 'shift', 'local', 'declare', 'typeset', 'readonly', 'unset', 'set', 'eval', 'command', 'trap', 'wait', 'getopts']);
+const SHELL_BUILTINS = new Set(['alias', 'unalias', 'break', 'continue', 'return', 'exit', 'shift', 'local', 'declare', 'typeset', 'readonly', 'unset', 'set', 'eval', 'command', 'trap', 'wait', 'getopts']);
 // Bash builtins that are practice commands in commands.ts or commands-script.ts (for type and command -v).
 const COMMAND_BUILTINS = new Set(['cd', 'echo', 'pwd', 'read', 'printf', 'source', '.', 'test', '[', 'export', 'let', 'true', 'false', ':', 'umask', 'type', 'history', 'alias', 'unalias', 'kill', 'jobs', 'fg', 'bg', 'help', 'hash', 'ulimit', 'logout', 'pushd', 'popd', 'dirs', 'shopt', 'exec', 'times', 'disown', 'suspend', 'builtin', 'enable', 'mapfile', 'readarray', 'fc', 'bind', 'compgen', 'complete', 'caller']);
 const KEYWORDS = new Set(['if', 'then', 'elif', 'else', 'fi', 'for', 'in', 'do', 'done', 'while', 'until', 'case', 'esac', 'function', 'time', '{', '}', '!', '[[', ']]']);
@@ -230,6 +233,8 @@ export class Shell {
   lastCode = 0;
   /** Shell functions by name. */
   functions = new Map<string, FuncDef>();
+  aliases = new Map<string, string>(DEFAULT_ALIASES);
+  private aliasBusy = new Set<string>(); // an alias is not expanded again inside its own value
 
   private frames: Frame[] = [{ kind: 'top', name0: '-bash', args: [], pid: 1602 }];
   private opts: Opts = { ...DEFAULT_OPTS };
@@ -632,8 +637,14 @@ export class Shell {
       .join('');
   }
 
+  /** One word without splitting (assignments, here-documents, [[ ]], case): the words of "$@" are joined with spaces. */
   private segments(parts: WordPart[], io: IO): Seg[] {
-    return this.fields(parts, io, false).flat();
+    const out: Seg[] = [];
+    this.fields(parts, io, false).forEach((f, i) => {
+      if (i > 0) out.push({ text: ' ', quoted: true });
+      out.push(...f);
+    });
+    return out;
   }
 
   /** Expand to a glob pattern in which quoted characters are escaped (case, [[ == ]], ${x#pattern}). */
@@ -830,6 +841,16 @@ export class Shell {
     }
   }
 
+  private hereDocParts(body: string): WordPart[] {
+    try {
+      return parseHereDoc(body);
+    } catch (e) {
+      if (!(e instanceof ParseError)) throw e;
+      if (e.message.includes('``')) throw new ExpansionError(`bad substitution: no closing "\`" in ${body.slice(body.indexOf('`')).replace(/\n$/, '')}`);
+      throw new ExpansionError(`here-document: ${e.message}`);
+    }
+  }
+
   private argParts(arg: string): WordPart[] {
     try {
       return parseWordText(arg);
@@ -852,7 +873,7 @@ export class Shell {
     this.scriptDepth++;
     this.traceLevel++;
     try {
-      this.lastSubst = this.isolate(false, () => this.catchExit(() => this.runCommands({ commands: body, error: null }, '', sub, null)));
+      this.lastSubst = this.subshell(() => this.runCommands({ commands: body, error: null }, '', sub, null));
     } finally {
       this.scriptDepth--;
       this.traceLevel--;
@@ -896,7 +917,22 @@ export class Shell {
     return { output, clear };
   }
 
+  /** Never throws: a bug in the simulation must not crash the app, so it is reported like a shell error. */
   private runLine(raw: string): RunOutput {
+    try {
+      return this.runLineUnguarded(raw);
+    } catch (e) {
+      this.pending = null;
+      this.lastCode = e instanceof RangeError ? 2 : 1;
+      const msg =
+        e instanceof RangeError
+          ? 'too many nested commands or brackets (practice terminal limit)'
+          : `the practice terminal could not run this command (${e instanceof Error ? e.message : String(e)})`;
+      return { output: `-bash: ${msg}\n`, clear: false };
+    }
+  }
+
+  private runLineUnguarded(raw: string): RunOutput {
     const line = raw.replace(/\r$/, '');
     const p = this.pending;
     if (!p && !line.trim()) return { output: '', clear: false };
@@ -912,7 +948,7 @@ export class Shell {
     const screen = new Sink();
     screen.tty = true;
     this.top(screen, () => this.runCommands(prog, text, { in: new InputStream('', true), out: screen, err: screen }, null));
-    return { output: screen.text, clear: screen.cleared };
+    return { output: screenText(screen.text), clear: screen.cleared };
   }
 
   /** Run at the outermost level: reset the runaway guards and report a stop. */
@@ -1020,7 +1056,7 @@ export class Shell {
         const last = k === pl.cmds.length - 1;
         const out = last ? io.out : new Sink();
         const sub: IO = { in: input, out, err: !last && pl.pipeStderr[k] ? out : io.err };
-        codes.push(this.isolate(false, () => this.catchExit(() => this.runCommand(cmd, sub))));
+        codes.push(this.subshell(() => this.runCommand(cmd, sub)));
         if (!last) input = new InputStream(out.text);
       });
       code = this.opts.pipefail ? ([...codes].reverse().find((c) => c !== 0) ?? 0) : codes[codes.length - 1];
@@ -1028,6 +1064,19 @@ export class Shell {
     if (pl.bang) code = code === 0 ? 1 : 0;
     if (pl.time) io.err.write('\nreal\t0m0.002s\nuser\t0m0.001s\nsys\t0m0.001s\n');
     return (this.lastCode = code);
+  }
+
+  /** Run in a subshell: ( ), $( ) or one part of a pipeline. exit and return end only the subshell, and break cannot reach a loop outside it. */
+  private subshell(fn: () => number): number {
+    return this.isolate(false, () => {
+      this.loopDepth = 0;
+      try {
+        return fn();
+      } catch (e) {
+        if (e instanceof ExitSignal || e instanceof ReturnSignal) return (this.lastCode = e.code);
+        throw e;
+      }
+    });
   }
 
   private catchExit(fn: () => number): number {
@@ -1087,7 +1136,7 @@ export class Shell {
       case 'group':
         return this.runList(cmd.body, io);
       case 'subshell':
-        return this.isolate(false, () => this.catchExit(() => this.runList(cmd.body, io)));
+        return this.subshell(() => this.runList(cmd.body, io));
       case 'if': {
         for (const c of cmd.clauses) {
           if (this.inCond(() => this.runList(c.cond, io)) === 0) return this.runList(c.body, io);
@@ -1178,6 +1227,8 @@ export class Shell {
   }
 
   private runSimple(cmd: SimpleCommand, io: IO): number {
+    const viaAlias = this.expandAlias(cmd, io);
+    if (viaAlias !== null) return viaAlias;
     this.lineno = cmd.line;
     if (++this.steps > MAX_STEPS) this.abort(`stopped after running ${MAX_STEPS} commands (practice terminal limit). Is a loop or function running forever?`);
     this.lastSubst = null;
@@ -1225,6 +1276,26 @@ export class Shell {
     }
   }
 
+  /** Aliases work at the prompt, not in scripts: the first word is replaced by the alias text. null: no alias. */
+  private expandAlias(cmd: SimpleCommand, io: IO): number | null {
+    const w = cmd.words[0];
+    const p = w?.parts[0];
+    if (!w || this.inScript || w.parts.length !== 1 || p.type !== 'lit' || p.quoted || p.text !== w.raw) return null;
+    const value = this.aliases.get(w.raw);
+    if (value === undefined || this.aliasBusy.has(w.raw)) return null;
+    const head = onlySimple(parseProgram(value, true));
+    this.aliasBusy.add(w.raw);
+    try {
+      // alias ll='ls -l': the alias words go in front of the other words, and assignments and redirections stay
+      if (head) return this.runSimple({ ...cmd, words: [...head.words, ...cmd.words.slice(1)] }, io);
+      // alias x='cd /tmp; ls': the alias text and the other words run as a command line
+      const src = [value, ...cmd.words.slice(1).map((x) => x.raw)].join(' ');
+      return this.runCommands(parseProgram(src, true), src, io, null);
+    } finally {
+      this.aliasBusy.delete(w.raw);
+    }
+  }
+
   private trace(io: IO, argv: string[], assigns: string[] = []) {
     io.err.write(`${'+'.repeat(1 + this.traceLevel)} ${[...assigns, ...argv.map(shQuote)].join(' ')}\n`);
   }
@@ -1260,7 +1331,7 @@ export class Shell {
     };
     for (const r of rs) {
       if (r.op === '<<') {
-        const body = r.heredoc!.expand ? this.expandValue(parseHereDoc(r.heredoc!.body), next) : r.heredoc!.body;
+        const body = r.heredoc!.expand ? this.expandValue(this.hereDocParts(r.heredoc!.body), next) : r.heredoc!.body;
         if (r.fd === 0) next.in = new InputStream(body);
         continue;
       }
@@ -1333,12 +1404,13 @@ export class Shell {
   }
 
   /** What a command name runs, for type, which and command -v. Practice commands live in /usr/bin. */
-  describe(name: string, pathOnly = false): { kind: 'function'; text: string } | { kind: 'keyword' | 'builtin' } | { kind: 'file'; path: string } | null {
+  describe(name: string, pathOnly = false): { kind: 'function' | 'alias'; text: string } | { kind: 'keyword' | 'builtin' } | { kind: 'file'; path: string } | null {
     if (pathOnly) {
       const t = this.lookup(name);
       if ('error' in t || ('path' in t && !canAccess(t.node, 'x', this.uid, this.gids))) return null;
       return { kind: 'file', path: 'path' in t ? joinPath(splitPath(this.cwd, t.path, this.user.home)) : `/usr/bin/${t.name}` };
     }
+    if (this.aliases.has(name) && !this.inScript) return { kind: 'alias', text: this.aliases.get(name)! };
     if (KEYWORDS.has(name)) return { kind: 'keyword' };
     if (this.functions.has(name)) return { kind: 'function', text: this.functionText(name) };
     if (SHELL_BUILTINS.has(name) || (COMMAND_BUILTINS.has(name) && commandFor(name))) return { kind: 'builtin' };
@@ -1581,12 +1653,15 @@ export class Shell {
     this.frames.push(frame);
     this.funcDepth++;
     const frames = this.frames;
+    const loops = this.loopDepth;
+    this.loopDepth = 0; // break in a function does not end the caller's loop
     try {
       return this.runCommand(body, io);
     } catch (e) {
       if (e instanceof ReturnSignal) return (this.lastCode = e.code);
       throw e;
     } finally {
+      this.loopDepth = loops;
       this.funcDepth--;
       frames.splice(frames.lastIndexOf(frame), 1);
       for (const [k, v] of frame.locals!) {
@@ -1975,6 +2050,31 @@ export class Shell {
         }
         return code;
       }
+      case 'alias': {
+        const show = (n: string) => io.out.write(`alias ${n}='${this.aliases.get(n)!.replace(/'/g, "'\\''")}'\n`);
+        const names = args.filter((a) => a !== '-p');
+        if (!names.length) [...this.aliases.keys()].sort().forEach(show);
+        let code = 0;
+        for (const a of names) {
+          const eq = a.indexOf('=');
+          if (eq < 0) {
+            if (this.aliases.has(a)) show(a);
+            else code = err(`alias: ${a}: not found`);
+          } else if (eq === 0 || /[\s/$`'"\\;&|()<>]/.test(a.slice(0, eq))) code = err(`alias: \`${a.slice(0, eq)}': invalid alias name`);
+          else this.aliases.set(a.slice(0, eq), a.slice(eq + 1));
+        }
+        return code;
+      }
+      case 'unalias': {
+        if (!args.length) return err('unalias: usage: unalias [-a] name [name ...]', 2);
+        if (args[0] === '-a') {
+          this.aliases.clear();
+          return 0;
+        }
+        let code = 0;
+        for (const a of args) if (!this.aliases.delete(a)) code = err(`unalias: ${a}: not found`);
+        return code;
+      }
       case 'set':
         return this.setBuiltin(args, io, err);
       case 'eval': {
@@ -1997,6 +2097,7 @@ export class Shell {
               if (verbose) err(`command: ${n}: not found`);
               code = 1;
             } else if (d.kind === 'file') io.out.write(verbose ? `${n} is ${d.path}\n` : `${d.path}\n`);
+            else if (d.kind === 'alias') io.out.write(verbose ? `${n} is aliased to \`${d.text}'\n` : `alias ${n}='${d.text}'\n`);
             else if (!verbose) io.out.write(`${n}\n`);
             else io.out.write(d.kind === 'function' ? `${n} is a function\n${d.text}` : `${n} is a shell ${d.kind}\n`);
           }
@@ -2215,6 +2316,27 @@ interface Seg {
 function errorResult(name: string, e: unknown): CommandResult {
   if (e instanceof FsError) return { stdout: '', stderr: `${name}: ${errorText[e.reason]}\n`, code: 1 };
   return { stdout: '', stderr: `${name}: ${(e as Error).message}\n`, code: 1 };
+}
+
+/** The screen shows at most MAX_SCREEN characters of one command line: the end, as a terminal would. */
+function screenText(text: string): string {
+  if (text.length <= MAX_SCREEN) return text;
+  let tail = text.slice(-MAX_SCREEN);
+  const nl = tail.indexOf('\n');
+  if (nl >= 0 && nl < tail.length - 1) tail = tail.slice(nl + 1);
+  const hidden = text.slice(0, text.length - tail.length).split('\n').length - 1;
+  return `[${hidden} earlier lines not shown (practice terminal limit)]\n${tail}`;
+}
+
+/** The one plain command of a parsed text (no assignments, redirections, pipes or lists), or null. */
+function onlySimple(prog: ParseResult): SimpleCommand | null {
+  if (prog.error || prog.commands.length !== 1) return null;
+  const list = prog.commands[0].list;
+  if (list.length !== 1 || list[0].rest.length || list[0].background) return null;
+  const pl = list[0].first;
+  const c = pl.cmds[0];
+  if (pl.cmds.length !== 1 || pl.bang || pl.time || c.type !== 'simple' || c.assigns.length || c.redirects.length) return null;
+  return c;
 }
 
 /** Quote a word the way set -x shows it. */
