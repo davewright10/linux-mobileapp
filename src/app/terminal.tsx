@@ -14,7 +14,7 @@ interface Line {
 }
 
 const WELCOME = 'Red Hat Enterprise Linux 10.0 practice server (simulated).\nType "help" to see the commands you can use.\n';
-const KEYS = ['Tab', '↑', '↓', '|', '/', '-', '~', '>', '*', '$', '&&', 'Clear'];
+const KEYS = ['Tab', '^C', '↑', '↓', '|', '/', '-', '~', '>', '*', '$', '&&', 'Clear'];
 const MAX_LINES = 400;
 
 export default function TerminalScreen() {
@@ -77,6 +77,13 @@ export default function TerminalScreen() {
       pos = k === '↑' ? Math.max(0, pos - 1) : Math.min(h.length, pos + 1);
       historyPos.current = pos;
       setInput(h[pos] ?? '');
+    } else if (k === '^C') {
+      // Ctrl+C: throw away an unfinished multi-line command (the "> " prompt) or the line being typed
+      append([{ text: prompt + input + '^C', cmd: true }]);
+      sh.cancelInput();
+      setInput('');
+      setPrompt(sh.prompt());
+      historyPos.current = null;
     } else if (k === 'Clear') {
       setInput('');
     } else {

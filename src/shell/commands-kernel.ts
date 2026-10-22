@@ -67,6 +67,8 @@ import {
   writeSysctl,
 } from './kernel-state';
 import type { Shell } from './shell';
+import { journaldStart } from './journal';
+import { runningHostname } from './state';
 import type { NmConnection, SystemState, User } from './state';
 
 type Command = (ctx: CommandContext) => CommandResult;
@@ -161,7 +163,7 @@ const uname: Command = ({ sh, args }) => {
   }
   const k = sh.state.kernel;
   const fields: [string, string][] = [
-    ['s', 'Linux'], ['n', sh.state.hostname], ['r', k.running], ['v', kernelBuild(k.running)],
+    ['s', 'Linux'], ['n', runningHostname(sh.state)], ['r', k.running], ['v', kernelBuild(k.running)],
     ['m', 'x86_64'], ['p', 'x86_64'], ['i', 'x86_64'], ['o', 'GNU/Linux'],
   ];
   const shown = fields.filter(([f]) => want.has('a') || want.has(f)).map(([, v]) => v);
@@ -249,6 +251,8 @@ function bootSysctl(state: SystemState, journal: string[]): void {
 
 /** Runtime settings that a reboot throws away: services, firewall, network, processes. */
 function bootRuntime(state: SystemState, full: boolean, login: User): void {
+  state.transientHostname = undefined; // "hostname NAME" lasts until the reboot; /etc/hostname comes back
+  journaldStart(state); // with /var/log/journal (or Storage=persistent) this boot's journal is kept
   for (const s of Object.values(state.services)) s.active = full ? s.enabled : s.name === 'systemd-journald';
   state.firewall.services = [...state.firewall.permServices];
   state.firewall.ports = [...state.firewall.permPorts];

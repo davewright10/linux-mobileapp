@@ -362,7 +362,10 @@ test('R19-svccheck: before the sudo run, the script cannot start atd as student'
   out(sh, 'sudo systemctl start atd');
   assert.equal(done(sh, l, 6), false);
   out(sh, 'sudo systemctl stop atd');
-  out(sh, 'sudo svccheck sshd atd'); // by name works in the practice terminal
+  // sudo looks commands up in secure_path, which has no /usr/local/bin
+  assert.match(out(sh, 'sudo svccheck sshd atd'), /sudo: svccheck: command not found/);
+  assert.equal(done(sh, l, 6), false);
+  out(sh, 'sudo /usr/local/bin/svccheck sshd atd');
   assert.equal(done(sh, l, 6), true);
   out(sh, 'svccheck sshd atd > ~/svccheck.txt');
   assert.equal(done(sh, l, 7), true);

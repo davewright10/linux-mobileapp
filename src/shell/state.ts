@@ -56,7 +56,12 @@ export interface AtJob {
 }
 
 export interface SystemState {
+  /** static host name, the content of /etc/hostname */
   hostname: string;
+  /** transient host name set by "hostname NAME"; a reboot or hostnamectl set-hostname clears it */
+  transientHostname?: string;
+  /** the first boot whose journal is kept on disk (/var/log/journal); unset: the journal is volatile */
+  journalPersistFrom?: number;
   root: FsNode;
   users: User[];
   groups: Group[];
@@ -115,6 +120,9 @@ export const AVAILABLE_PACKAGES: Record<string, { summary: string; service?: str
 export const pkgKey = (name: string) => name.replace(/-/g, '_');
 export const pkgName = (key: string) => key.replace(/_/g, '-');
 
+/** The host name the running system uses (prompt, uname -n): the transient name if one is set. */
+export const runningHostname = (state: SystemState) => state.transientHostname ?? state.hostname;
+
 const OS_RELEASE = `NAME="Red Hat Enterprise Linux"
 VERSION="10.0 (Coughlan)"
 ID="rhel"
@@ -156,6 +164,34 @@ dev01 192.168.4.40 fedora development
 web03 192.168.4.12 rhel10 test
 `;
 
+// shortened copy of the RHEL 10 /etc/sudoers; sudo reads the Defaults and rules from it
+const SUDOERS = `## Sudoers allows particular users to run various commands as
+## the root user, without needing the root password.
+##
+## This file must be edited with the 'visudo' command.
+
+Defaults   !visiblepw
+Defaults    always_set_home
+Defaults    match_group_by_gid
+Defaults    always_query_group_plugin
+Defaults    env_reset
+Defaults    env_keep =  "COLORS DISPLAY HOSTNAME HISTSIZE KDEDIR LS_COLORS"
+Defaults    env_keep += "MAIL QTDIR USERNAME LANG LC_ADDRESS LC_CTYPE"
+Defaults    secure_path = /sbin:/bin:/usr/sbin:/usr/bin
+
+## Allow root to run any commands anywhere
+root	ALL=(ALL) 	ALL
+
+## Allows people in group wheel to run all commands
+%wheel	ALL=(ALL)	ALL
+
+## Same thing without a password
+# %wheel	ALL=(ALL)	NOPASSWD: ALL
+
+## Read drop-in files from /etc/sudoers.d (the # here does not mean a comment)
+#includedir /etc/sudoers.d
+`;
+
 const NOTES = `Welcome to the practice terminal!
 This is a simulated RHEL 10 system called server1.
 You are logged in as "student", who can use sudo.
@@ -181,7 +217,8 @@ function etcFiles(root: FsNode) {
   add('chrony.conf', '# Use public servers from the pool.ntp.org project.\npool 2.rhel.pool.ntp.org iburst\ndriftfile /var/lib/chrony/drift\nmakestep 1.0 3\nrtcsync\nlogdir /var/log/chrony\n');
   add('resolv.conf', 'search example.com\nnameserver 192.168.4.1\n');
   add('login.defs', 'PASS_MAX_DAYS\t99999\nPASS_MIN_DAYS\t0\nPASS_WARN_AGE\t7\nUID_MIN\t\t1000\nGID_MIN\t\t1000\nCREATE_HOME\tyes\nUMASK\t\t022\n');
-  add('sudoers', '## Allows people in group wheel to run all commands\n%wheel\tALL=(ALL)\tALL\n', 0o440);
+  add('sudoers', SUDOERS, 0o440);
+  etc.children!['sudoers.d'] = makeDir(0, 0, 0o750);
   add('crontab', 'SHELL=/bin/bash\nPATH=/sbin:/bin:/usr/sbin:/usr/bin\n# .---------------- minute (0 - 59)\n# |  .------------- hour (0 - 23)\n# |  |  .---------- day of month (1 - 31)\n# |  |  |  .------- month (1 - 12)\n# |  |  |  |  .---- day of week (0 - 6) (Sunday=0)\n# *  *  *  *  * user-name  command to be executed\n');
   const ssh = makeDir();
   ssh.children!['sshd_config'] = makeFile(SSHD_CONFIG, 0, 0, 0o600);
@@ -215,6 +252,9 @@ export function createInitialState(): SystemState {
   const usr = c.usr.children!;
   usr.bin = makeDir();
   usr.sbin = makeDir();
+  // /usr/local: software the administrator installs; /usr/local/bin is in every user's PATH
+  usr.local = makeDir();
+  for (const d of ['bin', 'etc', 'games', 'include', 'lib', 'lib64', 'libexec', 'sbin', 'share', 'src']) usr.local.children![d] = makeDir();
   usr.share = makeDir();
   usr.share.children!.doc = makeDir();
   usr.share.children!.doc.children!.bash = makeDir();

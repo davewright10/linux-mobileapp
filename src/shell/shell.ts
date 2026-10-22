@@ -34,7 +34,7 @@ import {
   splitAssign,
 } from './parser';
 import { KERNEL_FILES } from './kernel-state';
-import { SystemState, User, createInitialState } from './state';
+import { SystemState, User, createInitialState, runningHostname } from './state';
 import { STORAGE_FILES } from './storage-state';
 
 type FuncDef = Extract<Command, { type: 'func' }>;
@@ -110,6 +110,7 @@ type Chunk = [1 | 2, string];
 class Sink {
   text = '';
   cleared = false;
+  tty = false; // the terminal screen: ls prints columns there, one name per line elsewhere
   constructor(
     private log?: Chunk[],
     private fd: 1 | 2 = 1,
@@ -292,7 +293,7 @@ export class Shell {
     return groupIdsFor(this.state, this.user);
   }
   get shortHost() {
-    return this.state.hostname.split('.')[0];
+    return runningHostname(this.state).split('.')[0];
   }
   private get frame(): Frame {
     return this.frames[this.frames.length - 1];
@@ -318,11 +319,11 @@ export class Shell {
     return this.pending !== null;
   }
 
-  /** Throw away an unfinished multi-line command, as Ctrl+C does. */
+  /** Ctrl+C at the prompt: throw away an unfinished multi-line command. $? becomes 130, as in bash. */
   cancelInput(): string {
     const had = this.pending !== null;
     this.pending = null;
-    if (had) this.lastCode = 130;
+    this.lastCode = 130;
     return had ? '^C\n' : '';
   }
 
@@ -356,7 +357,7 @@ export class Shell {
       case 'PWD':
         return this.cwd;
       case 'HOSTNAME':
-        return this.state.hostname;
+        return runningHostname(this.state);
       case 'SHELL':
         return this.user.shell;
       case 'PATH': {
@@ -909,6 +910,7 @@ export class Shell {
     this.pending = null;
     if (hist.trim()) this.history.push(hist.trim());
     const screen = new Sink();
+    screen.tty = true;
     this.top(screen, () => this.runCommands(prog, text, { in: new InputStream('', true), out: screen, err: screen }, null));
     return { output: screen.text, clear: screen.cleared };
   }
@@ -1397,7 +1399,7 @@ export class Shell {
     const sessions = this.sessions;
     let res: CommandResult;
     try {
-      res = fn({ sh: this, args: g ? g.args : args, stdin, name });
+      res = fn({ sh: this, args: g ? g.args : args, stdin, name, tty: io.out.tty });
     } catch (e) {
       if (e instanceof Signal) throw e;
       res = errorResult(name, e);
@@ -1439,6 +1441,7 @@ export class Shell {
     }
     const log: Chunk[] = [];
     const io: IO = { in: new InputStream(stdin, stdin === '' && (this.cur?.in.tty ?? true)), out: new Sink(log, 1), err: new Sink(log, 2) };
+    io.out.tty = this.cur?.out.tty ?? false; // sudo ls at the prompt still writes to the terminal
     const outer = this.runDepth === 0;
     if (outer) {
       this.steps = 0;
@@ -1457,7 +1460,7 @@ export class Shell {
       if ('fn' in t) {
         let res: CommandResult;
         try {
-          res = t.fn({ sh: this, args: argv.slice(1), stdin, name: t.name });
+          res = t.fn({ sh: this, args: argv.slice(1), stdin, name: t.name, tty: io.out.tty });
         } catch (e) {
           if (e instanceof Signal) throw e;
           res = errorResult(t.name, e);
